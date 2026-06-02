@@ -12,6 +12,9 @@ const {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
+  REST,
+  Routes,
+  SlashCommandBuilder,
 } = require('discord.js');
 const { Rcon } = require('rcon-client');
 
@@ -137,11 +140,32 @@ async function endVote(channel) {
   votes = { yes: new Set(), no: new Set() };
 }
 
+// ── Auto-register slash commands on startup ───────────────────
+async function registerCommands() {
+  const commands = [
+    new SlashCommandBuilder()
+      .setName('voterestart')
+      .setDescription('Start a community vote to restart the Sanctuary PZ server')
+      .toJSON()
+  ];
+  const rest = new REST().setToken(DISCORD_TOKEN);
+  try {
+    await rest.put(
+      Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
+      { body: commands }
+    );
+    console.log('✅ /voterestart command registered!');
+  } catch (err) {
+    console.error('⚠️ Could not register commands:', err.message);
+  }
+}
+
 // ── Discord client ────────────────────────────────────────────
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-client.once('ready', () => {
+client.once('ready', async () => {
   console.log(`✅ Sanctuary Bot online as ${client.user.tag}`);
+  await registerCommands();
 });
 
 client.on('interactionCreate', async (interaction) => {
