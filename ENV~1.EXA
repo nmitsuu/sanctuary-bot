@@ -1,0 +1,23 @@
+# ── Discord ──────────────────────────────────────────────────
+# Get these from discord.com/developers/applications
+DISCORD_TOKEN=your_bot_token_here
+CLIENT_ID=your_bot_application_id
+GUILD_ID=your_discord_server_id
+
+# ── Channel IDs (right-click channel → Copy Channel ID) ──────
+VOTE_CHANNEL_ID=id_of_your_vote_restart_channel
+ANNOUNCE_CHANNEL_ID=id_of_your_general_channel
+ANNOUNCE_ROLE_ID=1230206441684729969
+
+# ── PZ Server RCON ───────────────────────────────────────────
+# IP from your IB dashboard (check after any machine transfers)
+RCON_HOST=172.240.71.247
+# RCON port from your server .ini file (RCONPort=)
+RCON_PORT=27015
+# RCON password from your server .ini file (RCONPassword=)
+RCON_PASSWORD=your_rcon_password_here
+
+# ── Vote settings ────────────────────────────────────────────
+MIN_VOTES=2
+VOTE_MINUTES=3
+COOLDOWN_MINUTES=30

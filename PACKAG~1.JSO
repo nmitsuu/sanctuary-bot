@@ -1,0 +1,15 @@
+{
+  "name": "sanctuary-restart-bot",
+  "version": "1.0.0",
+  "description": "Discord vote-to-restart bot for Sanctuary PZ server",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "register": "node register.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "rcon-client": "^4.2.3",
+    "dotenv": "^16.4.5"
+  }
+}
