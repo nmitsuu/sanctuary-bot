@@ -16,19 +16,22 @@ const {
   Routes,
   SlashCommandBuilder,
 } = require('discord.js');
-const { Rcon } = require('rcon-client');
 
 // ── Config (set these as environment variables in Railway) ───
 const DISCORD_TOKEN       = process.env.DISCORD_TOKEN;
-const VOTE_CHANNEL_ID     = process.env.VOTE_CHANNEL_ID;     // #vote-restart channel ID
-const ANNOUNCE_CHANNEL_ID = process.env.ANNOUNCE_CHANNEL_ID; // #general channel
-const ANNOUNCE_ROLE_ID    = process.env.ANNOUNCE_ROLE_ID;    // role to ping (e.g. Tester role) ID
-const RCON_HOST           = process.env.RCON_HOST;           // your server IP
-const RCON_PORT           = parseInt(process.env.RCON_PORT)  || 27015;
-const RCON_PASSWORD       = process.env.RCON_PASSWORD;
-const MIN_VOTES           = parseInt(process.env.MIN_VOTES)  || 3;
+const VOTE_CHANNEL_ID     = process.env.VOTE_CHANNEL_ID;
+const ANNOUNCE_CHANNEL_ID = process.env.ANNOUNCE_CHANNEL_ID;
+const ANNOUNCE_ROLE_ID    = process.env.ANNOUNCE_ROLE_ID;
+const MIN_VOTES           = parseInt(process.env.MIN_VOTES)  || 2;
 const VOTE_MINUTES        = parseInt(process.env.VOTE_MINUTES) || 3;
 const COOLDOWN_MINUTES    = parseInt(process.env.COOLDOWN_MINUTES) || 30;
+
+// ── IB Dashboard API config ───────────────────────────────────
+const IB_EMAIL            = process.env.IB_EMAIL;
+const IB_PASSWORD         = process.env.IB_PASSWORD;
+const IB_GUID             = process.env.IB_GUID;
+const IB_SERVER_USERNAME  = process.env.IB_SERVER_USERNAME;
+const IB_SERVER_ID        = process.env.IB_SERVER_ID;
 
 // ── State ────────────────────────────────────────────────────
 let voteActive    = false;
@@ -41,21 +44,57 @@ let lastVoteEnd   = null;
 // ── Helpers ──────────────────────────────────────────────────
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-async function sendRcon(command) {
-  const rcon = new Rcon({ host: RCON_HOST, port: RCON_PORT, password: RCON_PASSWORD });
-  try {
-    await rcon.connect();
-    await rcon.send(command);
-    await rcon.end();
-    return true;
-  } catch (err) {
-    console.error('[RCON error]', err.message);
-    return false;
+// Log in to IB dashboard and return session cookie
+async function ibLogin() {
+  const body = new URLSearchParams({ email: IB_EMAIL, password: IB_PASSWORD });
+  const res = await fetch('https://dashboard.indifferentbroccoli.com/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+    redirect: 'manual',
+  });
+  const setCookie = res.headers.get('set-cookie') || '';
+  const match = setCookie.match(/indifferentSess=[^;]+/);
+  if (!match) {
+    console.error('[IB] Login failed — could not get session cookie');
+    return null;
   }
+  console.log('[IB] Login successful');
+  return match[0];
 }
 
-async function serverMsg(text) {
-  return await sendRcon(`servermsg "${text}"`);
+// Restart the server via IB dashboard API
+async function ibRestart() {
+  try {
+    const cookie = await ibLogin();
+    if (!cookie) return false;
+
+    const body = new URLSearchParams({
+      guid:                IB_GUID,
+      serverLinuxUsername: IB_SERVER_USERNAME,
+      serverId:            IB_SERVER_ID,
+    });
+
+    const res = await fetch('https://dashboard.indifferentbroccoli.com/restart', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Cookie': cookie,
+      },
+      body: body.toString(),
+    });
+
+    if (res.ok) {
+      console.log('[IB] Restart triggered successfully');
+      return true;
+    } else {
+      console.error('[IB] Restart failed — status:', res.status);
+      return false;
+    }
+  } catch (err) {
+    console.error('[IB] Restart error:', err.message);
+    return false;
+  }
 }
 
 // ── Vote embed builder ────────────────────────────────────────
@@ -84,30 +123,69 @@ function buildEmbed(status = 'active') {
     .setFooter({ text: `Majority wins  •  Min ${MIN_VOTES} votes  •  ${VOTE_MINUTES} min window` });
 }
 
+// Send an in-game message via IB dashboard RCON
+async function ibServerMsg(cookie, text) {
+  try {
+    const res = await fetch('https://dashboard.indifferentbroccoli.com/rconsend', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Cookie': cookie,
+      },
+      body: JSON.stringify({
+        serverLinuxUsername: IB_SERVER_USERNAME,
+        command: `servermsg "${text}"`,
+      }),
+    });
+    return res.ok;
+  } catch (err) {
+    console.error('[IB RCON error]', err.message);
+    return false;
+  }
+}
+
 // ── Restart sequence (runs after vote passes) ─────────────────
 async function runRestartSequence(channel) {
-  const ok = await serverMsg('A player vote has passed! Server restarting in 10 minutes — find a safe spot!');
-  if (!ok) {
-    await channel.send('⚠️ **Could not reach the server via RCON.** Please ask an admin to restart manually using the IB bot.');
-    voteActive = false;
-    return;
+  // Login once and reuse the cookie for all IB calls
+  const cookie = await ibLogin();
+
+  async function msg(discord, ingame) {
+    await channel.send(discord);
+    if (cookie && ingame) await ibServerMsg(cookie, ingame);
   }
-  await channel.send('🗳️ **Vote passed!** Server restarting in **10 minutes**. In-game announcement sent!');
+
+  await msg(
+    '🗳️ **Vote passed!** Server restarting in **10 minutes** — find a safe spot!',
+    'Server Restart Vote Started: Restarting in 10 minutes!'
+  );
 
   await sleep(5 * 60 * 1000);
-  await serverMsg('Server restarting in 5 minutes!');
-  await channel.send('⏰ **5 minutes** until restart.');
+  await msg('⏰ **5 minutes** until restart.', 'Server Restart Vote Started: Restarting in 5 minutes!');
 
   await sleep(4 * 60 * 1000);
-  await serverMsg('Server restarting in 1 minute! Please find shelter now!');
-  await channel.send('⏰ **1 minute** until restart!');
+  await msg('⏰ **1 minute** until restart! Find shelter now!', 'Server Restart Vote Started: Restarting in 1 minute!');
 
   await sleep(60 * 1000);
-  await serverMsg('Restarting now — see you on the other side!');
-  await channel.send('🔄 **Restarting server now...**');
+  await msg('🔄 **Restarting now...**', 'Server is restarting now.');
 
-  await sleep(3000);
-  await sendRcon('quit');
+  // Trigger restart via IB API (reuse same cookie)
+  try {
+    const body = new URLSearchParams({
+      guid:                IB_GUID,
+      serverLinuxUsername: IB_SERVER_USERNAME,
+      serverId:            IB_SERVER_ID,
+    });
+    const res = await fetch('https://dashboard.indifferentbroccoli.com/restart', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': cookie },
+      body: body.toString(),
+    });
+    if (!res.ok) throw new Error('status ' + res.status);
+    console.log('[IB] Restart triggered successfully');
+  } catch (err) {
+    console.error('[IB] Restart error:', err.message);
+    await channel.send('⚠️ **Restart failed!** Could not reach the IB dashboard. Please ask an admin to restart manually.');
+  }
 }
 
 // ── End vote and tally ────────────────────────────────────────
