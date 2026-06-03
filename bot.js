@@ -255,6 +255,12 @@ async function ibGetPlayers(cookie) {
     }
 
     // Server is offline if no container found at all
+    // Debug: log what the HTML contains around server status
+    const statusHint = html.match(/deploy_status[^"]*"[^"]*"/)?.[0] || 'not found';
+    const runningHint = html.match(/data-running="[^"]*"/)?.[0] || 'not found';
+    const stoppedHint = html.includes('stopped') ? 'has:stopped' : 'no:stopped';
+    console.log('[ibGetPlayers debug] maxMatch:', !!maxMatch, '| status:', statusHint, '| running:', runningHint, '|', stoppedHint);
+
     if (!maxMatch) return null;
 
     return { count: players.length, maxSlots, players, isOffline };
