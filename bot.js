@@ -441,13 +441,16 @@ async function buildStatusContent(cookie) {
 
 async function updateStatusChannel() {
   if (!STATUS_CHANNEL_ID) return;
+  console.log('[Status] Running update tick...');
   try {
     const channel = await client.channels.fetch(STATUS_CHANNEL_ID);
-    if (!channel) return;
+    if (!channel) { console.log('[Status] Channel not found!'); return; }
 
     const cookie = await ibLogin();
+    if (!cookie) { console.log('[Status] Login failed, skipping tick'); return; }
+
     const { status, text } = await buildStatusContent(cookie);
-    console.log(`[Status] Updating channel — status: ${status}`);
+    console.log(`[Status] status=${status}, updating message...`);
 
     // Rename channel if status changed
     const emoji = status === 'online' ? '🟢' : status === 'offline' ? '🔴' : '🟠';
@@ -456,32 +459,48 @@ async function updateStatusChannel() {
       try {
         await channel.setName(`${emoji}-${baseName}`);
         lastChannelStatus = status;
+        console.log(`[Status] Channel renamed to ${emoji}-${baseName}`);
       } catch (e) {
-        console.log('[Status] Channel rename skipped (rate limit?)');
+        console.log('[Status] Channel rename skipped (rate limit):', e.message);
       }
     }
 
-    // Edit existing message or post new one
+    // Try to edit existing message
+    let edited = false;
     if (statusMessage) {
       try {
         await statusMessage.edit(text);
-      } catch {
-        statusMessage = null; // message was deleted, repost
+        edited = true;
+        console.log('[Status] Message edited successfully');
+      } catch (e) {
+        console.log('[Status] Edit failed, will repost:', e.message);
+        statusMessage = null;
       }
     }
 
-    if (!statusMessage) {
-      // Clear old messages and post fresh
-      const messages = await channel.messages.fetch({ limit: 10 });
-      const botMessages = messages.filter(m => m.author.id === client.user.id);
-      for (const [, msg] of botMessages) {
-        try { await msg.delete(); } catch {}
+    // If no message or edit failed, find existing bot message or post new
+    if (!edited) {
+      try {
+        const messages = await channel.messages.fetch({ limit: 20 });
+        const botMessages = messages.filter(m => m.author.id === client.user.id);
+        // Try to reuse the most recent bot message
+        const existing = botMessages.first();
+        if (existing) {
+          statusMessage = existing;
+          await statusMessage.edit(text);
+          console.log('[Status] Reused existing message');
+        } else {
+          statusMessage = await channel.send(text);
+          console.log('[Status] Posted new message');
+        }
+      } catch (e) {
+        console.error('[Status] Failed to post/edit message:', e.message);
+        statusMessage = null;
       }
-      statusMessage = await channel.send(text);
     }
 
   } catch (err) {
-    console.error('[Status] Error updating status channel:', err.message);
+    console.error('[Status] Unexpected error:', err.message);
   }
 }
 
