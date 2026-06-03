@@ -144,6 +144,46 @@ async function ibServerMsg(cookie, text) {
   }
 }
 
+// Check if PZ server is online by pinging via RCON
+async function ibCheckOnline(cookie) {
+  try {
+    const res = await fetch('https://dashboard.indifferentbroccoli.com/rconsend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Cookie': cookie },
+      body: JSON.stringify({
+        serverLinuxUsername: IB_SERVER_USERNAME,
+        command: 'players',
+      }),
+    });
+    if (!res.ok) return false;
+    const text = await res.text();
+    // If response contains error/offline indicators, server is down
+    const lower = text.toLowerCase();
+    return !lower.includes('offline') && !lower.includes('not running') && !lower.includes('error');
+  } catch {
+    return false;
+  }
+}
+
+// Poll until server is back online, then post in Discord
+async function waitForServerOnline(channel) {
+  const cookie = await ibLogin();
+  if (!cookie) return;
+
+  await channel.send('⏳ Waiting for server to come back online...');
+
+  const maxAttempts = 20; // up to 10 minutes (every 30s)
+  for (let i = 0; i < maxAttempts; i++) {
+    await sleep(30 * 1000);
+    const online = await ibCheckOnline(cookie);
+    if (online) {
+      await channel.send('✅ **Server Restarted:** Server is now back online!');
+      return;
+    }
+  }
+  await channel.send('⚠️ Server is taking longer than expected. Please check the IB dashboard manually.');
+}
+
 // ── Restart sequence (runs after vote passes) ─────────────────
 async function runRestartSequence(channel) {
   // Login once and reuse the cookie for all IB calls
@@ -155,14 +195,14 @@ async function runRestartSequence(channel) {
   }
 
   await msg(
-    '🗳️ **Vote passed!** Server restarting in **10 minutes** — find a safe spot!',
-    'Server Restart Vote Started: Restarting in 10 minutes!'
+    '🗳️ **Vote passed!** Server restarting in **5 minutes** — find a safe spot!',
+    'Server Restart Vote Started: Restarting in 5 minutes!'
   );
 
-  await sleep(5 * 60 * 1000);
-  await msg('⏰ **5 minutes** until restart.', 'Server Restart Vote Started: Restarting in 5 minutes!');
+  await sleep(2 * 60 * 1000);
+  await msg('⏰ **3 minutes** until restart.', 'Server Restart Vote Started: Restarting in 3 minutes!');
 
-  await sleep(4 * 60 * 1000);
+  await sleep(2 * 60 * 1000);
   await msg('⏰ **1 minute** until restart! Find shelter now!', 'Server Restart Vote Started: Restarting in 1 minute!');
 
   await sleep(60 * 1000);
@@ -182,6 +222,8 @@ async function runRestartSequence(channel) {
     });
     if (!res.ok) throw new Error('status ' + res.status);
     console.log('[IB] Restart triggered successfully');
+    // Start polling for server to come back online
+    waitForServerOnline(channel).catch(() => {});
   } catch (err) {
     console.error('[IB] Restart error:', err.message);
     await channel.send('⚠️ **Restart failed!** Could not reach the IB dashboard. Please ask an admin to restart manually.');
@@ -224,7 +266,11 @@ async function registerCommands() {
     new SlashCommandBuilder()
       .setName('voterestart')
       .setDescription('Start a community vote to restart the Sanctuary PZ server')
-      .toJSON()
+      .toJSON(),
+    new SlashCommandBuilder()
+      .setName('servercheck')
+      .setDescription('Check if the Sanctuary PZ server is online or offline')
+      .toJSON(),
   ];
   const rest = new REST().setToken(DISCORD_TOKEN);
   try {
@@ -309,6 +355,12 @@ client.on('interactionCreate', async (interaction) => {
       () => endVote(interaction.channel),
       VOTE_MINUTES * 60 * 1000
     );
+
+    // Announce in-game that a vote has started
+    ibLogin().then(cookie => {
+      if (cookie) ibServerMsg(cookie, 'A server restart vote has started on Discord! Vote now before it closes!');
+    }).catch(() => {});
+
     return;
   }
 
@@ -334,6 +386,25 @@ client.on('interactionCreate', async (interaction) => {
       content: `You voted ${isYes ? '✅ **Yes**' : '❌ **No**'}! You can change your vote any time before it closes.`,
       ephemeral: true
     });
+  }
+});
+
+// ── /servercheck command ─────────────────────────────────────
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== 'servercheck') return;
+
+  await interaction.deferReply();
+
+  const cookie = await ibLogin();
+  if (!cookie) {
+    return interaction.editReply('❌ Could not connect to the server management panel. Try again later.');
+  }
+
+  const online = await ibCheckOnline(cookie);
+  if (online) {
+    await interaction.editReply('✅ **Server Status:** Online and running!');
+  } else {
+    await interaction.editReply('🔴 **Server Status:** Offline or currently restarting.');
   }
 });
 
