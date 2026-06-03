@@ -216,27 +216,39 @@ async function waitForServerOnline(channel) {
   await channel.send('⚠️ Server is taking longer than expected. Please check the IB dashboard manually.');
 }
 
-// ── Get online players via RCON ───────────────────────────────
+// ── Get online players by scraping IB dashboard HTML ─────────
 async function ibGetPlayers(cookie) {
   try {
-    const res = await fetch('https://dashboard.indifferentbroccoli.com/rconsend', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Cookie': cookie },
-      body: JSON.stringify({ serverLinuxUsername: IB_SERVER_USERNAME, command: 'players' }),
+    const res = await fetch('https://dashboard.indifferentbroccoli.com/', {
+      method: 'GET',
+      headers: { 'Cookie': cookie },
     });
     if (!res.ok) return null;
-    const raw  = await res.text();
-    // Try JSON first, fall back to raw text
-    let text = raw;
-    try { const j = JSON.parse(raw); text = j.output || j.result || j.data || raw; } catch {}
+    const html = await res.text();
 
-    const countMatch = text.match(/Players connected \((\d+)\)/i);
-    const count = countMatch ? parseInt(countMatch[1]) : 0;
-    const players = text.split('\n')
-      .filter(l => l.trim().startsWith('-'))
-      .map(l => l.trim().slice(1).trim())
-      .filter(Boolean);
-    return { count, players };
+    // Extract max slots
+    const maxMatch = html.match(/id="players-container-[^"]*"[^>]*data-max="(\d+)"/);
+    const maxSlots = maxMatch ? parseInt(maxMatch[1]) : 16;
+
+    // Extract player list - each li has avatar letter, name, time
+    const listMatch = html.match(/id="players-list-[^"]*"([\s\S]*?)<\/ul>/);
+    const players = [];
+    if (listMatch) {
+      const liMatches = [...listMatch[1].matchAll(/<li[^>]*>([\s\S]*?)<\/li>/g)];
+      for (const match of liMatches) {
+        const tokens = match[1]
+          .replace(/<[^>]+>/g, '|')
+          .split('|')
+          .map(t => t.trim())
+          .filter(Boolean);
+        const timeToken = tokens.find(t => /\d+h\s*\d*m?|\d+m/.test(t)) || '';
+        const nameTokens = tokens.filter(t => t !== timeToken && t.length > 1);
+        const name = nameTokens[0] || '';
+        if (name) players.push({ name, time: timeToken });
+      }
+    }
+
+    return { count: players.length, maxSlots, players };
   } catch { return null; }
 }
 
@@ -251,7 +263,7 @@ async function runRestartSequence(channel) {
       const statusCh = await client.channels.fetch(STATUS_CHANNEL_ID);
       if (statusCh) await statusCh.setName('🟠server-status');
       lastChannelStatus = 'restarting';
-      if (statusMessage) await statusMessage.edit('🟠 **Server Status: Restarting...**\n\n*The server is restarting. Back soon!*');
+      if (statusMessage) await statusMessage.edit('⚠️ **Server Status: Under Maintenance / Restarting**\n\n*The server is restarting. Back soon!*');
     } catch {}
   }
 
@@ -368,16 +380,20 @@ let lastChannelStatus = null; // track last known status to avoid spammy renames
 
 async function buildStatusContent(cookie) {
   const next = getNextRestart();
+  // next.timeStr = <t:unix:t>  next.fullStr = <t:unix:F>
+  // Build a relative timestamp by extracting the unix value from timeStr
+  const unixMatch = next.timeStr.match(/<t:(\d+):/);
+  const relStr = unixMatch ? `<t:${unixMatch[1]}:R>` : '';
+
   const data = await ibGetPlayers(cookie);
 
   if (!data) {
-    // Server offline
     return {
       status: 'offline',
       text: [
-        '🔴 **Server Status: Offline**',
+        '⛔️ **Server Status: Offline**',
         '',
-        `📅 **Next Restart:** ${next.timeStr} — <t:${next.unix}:R>`,
+        `🔄 **Next Restart:** ${next.timeStr}, ${relStr}`,
         '',
         '*No player data available.*'
       ].join('\n')
@@ -392,9 +408,9 @@ async function buildStatusContent(cookie) {
   return {
     status: 'online',
     text: [
-      '🟢 **Server Status: Online**',
+      '✅ **Server Status: Online**',
       '',
-      `📅 **Next Restart:** ${next.timeStr} — <t:${next.unix}:R>`,
+      `🔄 **Next Restart:** ${next.timeStr}, ${relStr}`,
       '',
       `🌼 **Players Online (${count}/${maxSlots})**`,
       ...playerLines
@@ -416,7 +432,7 @@ async function updateStatusChannel() {
     const baseName = 'server-status';
     if (status !== lastChannelStatus) {
       try {
-        await channel.setName(`${emoji}${baseName}`);
+        await channel.setName(`${emoji}-${baseName}`);
         lastChannelStatus = status;
       } catch (e) {
         console.log('[Status] Channel rename skipped (rate limit?)');
@@ -607,39 +623,17 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   try {
-    const res = await fetch('https://dashboard.indifferentbroccoli.com/rconsend', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Cookie': cookie },
-      body: JSON.stringify({ serverLinuxUsername: IB_SERVER_USERNAME, command: 'players' }),
-    });
-
-    if (!res.ok) {
-      return interaction.editReply('🔴 **Server appears to be offline.** No player data available.');
+    const data = await ibGetPlayers(cookie);
+    if (!data) {
+      return interaction.editReply('⛔️ **Server appears to be offline.** No player data available.');
     }
 
-    const raw = await res.text();
-
-    // Try to parse JSON wrapper if present
-    let playerText = raw;
-    try {
-      const parsed = JSON.parse(raw);
-      playerText = parsed.result || parsed.message || parsed.output || raw;
-    } catch (_) {}
-
-    if (!playerText || playerText.toLowerCase().includes('offline') || playerText.toLowerCase().includes('not running')) {
-      return interaction.editReply('🔴 **Server appears to be offline.** No player data available.');
-    }
-
-    // Format nicely
-    const lines = playerText.trim().split('\n').filter(l => l.trim());
-    const header = lines[0] || 'Players connected (0):';
-    const players = lines.slice(1).map(l => l.replace(/^-/, '').trim()).filter(Boolean);
-
-    if (players.length === 0) {
-      await interaction.editReply(`👻 **No players online** right now.\n\n*${header}*`);
+    const { count, maxSlots, players } = data;
+    if (count === 0) {
+      await interaction.editReply(`🌼 **Players Online (0/${maxSlots})**\n\n*No survivors online right now...*`);
     } else {
-      const list = players.map(p => `• ${p}`).join('\n');
-      await interaction.editReply(`🟢 **Players Online (${players.length}):**\n${list}`);
+      const list = players.map(p => `• **${p.name}** *(${p.time})*`).join('\n');
+      await interaction.editReply(`🌼 **Players Online (${count}/${maxSlots})**\n\n${list}`);
     }
   } catch (err) {
     await interaction.editReply('❌ Could not fetch player list. Try again later.');
