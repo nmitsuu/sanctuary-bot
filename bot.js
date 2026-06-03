@@ -262,7 +262,17 @@ async function ibGetPlayers(cookie) {
     // Debug: dump more context around server state
     const deploySection = html.match(/deploy_status[\s\S]{0,500}/)?.[0]?.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').slice(0,200) || 'not found';
     const serverMgmtSection = html.match(/Server Management[\s\S]{0,300}/)?.[0]?.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').slice(0,200) || 'not found';
-    console.log('[ibGetPlayers debug] maxMatch:', !!maxMatch);
+    // Debug: dump raw HTML around key areas
+    const htmlSnippet1 = html.slice(0, 2000).replace(/\s+/g, ' ');
+    const onlineIdx = html.indexOf('Online');
+    const offlineIdx = html.indexOf('Offline');  
+    const stoppedIdx = html.indexOf('Stopped');
+    const runningIdx = html.indexOf('Running');
+    console.log('[HTML debug] Online@', onlineIdx, 'Offline@', offlineIdx, 'Stopped@', stoppedIdx, 'Running@', runningIdx);
+    if (onlineIdx > -1) console.log('[HTML debug] around Online:', html.slice(Math.max(0,onlineIdx-100), onlineIdx+100).replace(/\s+/g,' '));
+    if (offlineIdx > -1) console.log('[HTML debug] around Offline:', html.slice(Math.max(0,offlineIdx-100), offlineIdx+100).replace(/\s+/g,' '));
+    if (stoppedIdx > -1) console.log('[HTML debug] around Stopped:', html.slice(Math.max(0,stoppedIdx-100), stoppedIdx+100).replace(/\s+/g,' '));
+    if (runningIdx > -1) console.log('[HTML debug] around Running:', html.slice(Math.max(0,runningIdx-100), runningIdx+100).replace(/\s+/g,' '));
     console.log('[ibGetPlayers debug] deploy section:', deploySection);
     console.log('[ibGetPlayers debug] serverMgmt section:', serverMgmtSection);
 
