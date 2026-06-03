@@ -511,7 +511,7 @@ client.once('ready', async () => {
   // Start live status channel updater
   if (STATUS_CHANNEL_ID) {
     await updateStatusChannel();                        // immediate first update
-    setInterval(updateStatusChannel, 60 * 1000);   // then every 1 minute
+    setInterval(updateStatusChannel, 30 * 1000);   // then every 30 seconds
     console.log('✅ Status channel updater started!');
   }
 });
