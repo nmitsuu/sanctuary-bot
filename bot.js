@@ -229,8 +229,7 @@ async function ibGetPlayers(cookie) {
 
     const countMatch = text.match(/Players connected \((\d+)\)/i);
     const count = countMatch ? parseInt(countMatch[1]) : 0;
-    const players = text.split('
-')
+    const players = text.split('\n')
       .filter(l => l.trim().startsWith('-'))
       .map(l => l.trim().slice(1).trim())
       .filter(Boolean);
