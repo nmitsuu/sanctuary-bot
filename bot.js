@@ -228,14 +228,27 @@ async function ibGetPlayers(cookie) {
     const maxSlots = maxMatch ? parseInt(maxMatch[1]) : 16;
 
     // Extract player list from players-list ul
+    // Each player li has: avatar letter div, then name + time divs
     const listMatch = html.match(/id="players-list-[^"]*"([\s\S]*?)<\/ul>/);
     const players = [];
     if (listMatch) {
       const listHtml = listMatch[1];
-      const nameMatches = [...listHtml.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/g)];
-      for (const match of nameMatches) {
-        const text = match[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-        if (text) players.push(text);
+      const liMatches = [...listHtml.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/g)];
+      for (const match of liMatches) {
+        const liHtml = match[1];
+        // Strip all tags to get raw text tokens
+        const tokens = liHtml
+          .replace(/<[^>]+>/g, '|')
+          .split('|')
+          .map(t => t.trim())
+          .filter(Boolean);
+        // tokens look like: ["m", "mitsu", "0h 42m"] - first is avatar letter, skip it
+        // Find the time token (matches pattern like "0h 42m" or "12m")
+        const timeToken = tokens.find(t => /\d+h\s*\d*m?|\d+m/.test(t)) || '';
+        // Name is the token before the time, skipping the single-char avatar
+        const nameTokens = tokens.filter(t => t !== timeToken && t.length > 1);
+        const name = nameTokens[0] || '';
+        if (name) players.push({ name, time: timeToken });
       }
     }
 
@@ -517,10 +530,10 @@ client.on('interactionCreate', async (interaction) => {
     const { count, maxSlots, players } = data;
 
     if (count === 0) {
-      await interaction.editReply(`👻 **No players online** right now. *(0 / ${maxSlots})*`);
+      await interaction.editReply(`🌼 **Players Online (0/${maxSlots})**\n\n*No survivors online right now...*`);
     } else {
-      const list = players.map(p => `• ${p}`).join('\n');
-      await interaction.editReply(`🟢 **Players Online (${count} / ${maxSlots}):**\n${list}`);
+      const list = players.map(p => `┃ **${p.name}** *(${p.time})*`).join('\n');
+      await interaction.editReply(`🌼 **Players Online (${count}/${maxSlots})**\n\n${list}`);
     }
   } catch (err) {
     await interaction.editReply('❌ Could not fetch player list. Try again later.');
