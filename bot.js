@@ -226,11 +226,15 @@ async function ibGetPlayers(cookie) {
     if (!res.ok) return null;
     const html = await res.text();
 
+    // Check server online status from the deploy status indicator
+    const isOffline = html.includes('deploy_status_henson') &&
+      (html.match(/status[^>]*>[^<]*(stopped|offline|error)/i));
+
     // Extract max slots
     const maxMatch = html.match(/id="players-container-[^"]*"[^>]*data-max="(\d+)"/);
     const maxSlots = maxMatch ? parseInt(maxMatch[1]) : 16;
 
-    // Extract player list - each li has avatar letter, name, time
+    // Extract player list - each li has avatar letter div, then name + time
     const listMatch = html.match(/id="players-list-[^"]*"([\s\S]*?)<\/ul>/);
     const players = [];
     if (listMatch) {
@@ -241,14 +245,19 @@ async function ibGetPlayers(cookie) {
           .split('|')
           .map(t => t.trim())
           .filter(Boolean);
-        const timeToken = tokens.find(t => /\d+h\s*\d*m?|\d+m/.test(t)) || '';
+        // Time token looks like "0h 42m" or "5m"
+        const timeToken = tokens.find(t => /^\d+h\s*\d*m?$|^\d+m$/.test(t)) || '';
+        // Skip single-char avatar tokens, find name (length > 1, not a time)
         const nameTokens = tokens.filter(t => t !== timeToken && t.length > 1);
         const name = nameTokens[0] || '';
-        if (name) players.push({ name, time: timeToken });
+        if (name && timeToken) players.push({ name, time: timeToken });
       }
     }
 
-    return { count: players.length, maxSlots, players };
+    // Server is offline if no container found at all
+    if (!maxMatch) return null;
+
+    return { count: players.length, maxSlots, players, isOffline };
   } catch { return null; }
 }
 
@@ -387,7 +396,7 @@ async function buildStatusContent(cookie) {
 
   const data = await ibGetPlayers(cookie);
 
-  if (!data) {
+  if (!data || data.isOffline) {
     return {
       status: 'offline',
       text: [
@@ -403,7 +412,7 @@ async function buildStatusContent(cookie) {
   const { count, maxSlots, players } = data;
   const playerLines = count === 0
     ? ['*No survivors online right now...*']
-    : players.map(p => `• **${p.name}** *(${p.time})*`);
+    : players.map(p => `•  **${p.name}**${p.time ? ` *(${p.time})*` : ''}`);
 
   return {
     status: 'online',
@@ -593,11 +602,12 @@ client.on('interactionCreate', async (interaction) => {
     return interaction.editReply('❌ Could not connect to the server management panel. Try again later.');
   }
 
-  const online = await ibCheckOnline(cookie);
-  if (online) {
-    await interaction.editReply('✅ **Server Status:** Online and running!');
+  const data = await ibGetPlayers(cookie);
+  if (data && !data.isOffline) {
+    const { count, maxSlots } = data;
+    await interaction.editReply(`✅ **Server Status:** Online and running! *(${count}/${maxSlots} players)*`);
   } else {
-    await interaction.editReply('🔴 **Server Status:** Offline or currently restarting.');
+    await interaction.editReply('⛔️ **Server Status:** Offline or currently restarting.');
   }
 });
 
@@ -632,7 +642,7 @@ client.on('interactionCreate', async (interaction) => {
     if (count === 0) {
       await interaction.editReply(`🌼 **Players Online (0/${maxSlots})**\n\n*No survivors online right now...*`);
     } else {
-      const list = players.map(p => `• **${p.name}** *(${p.time})*`).join('\n');
+      const list = players.map(p => `•  **${p.name}**` + (p.time ? ` *(${p.time})*` : '')).join('\n');
       await interaction.editReply(`🌼 **Players Online (${count}/${maxSlots})**\n\n${list}`);
     }
   } catch (err) {
