@@ -508,11 +508,12 @@ client.on('interactionCreate', async (interaction) => {
       body: JSON.stringify({ serverLinuxUsername: IB_SERVER_USERNAME, command: 'players' }),
     });
 
-    if (!res.ok) {
-      return interaction.editReply('🔴 **Server appears to be offline.** No player data available.');
-    }
-
     const raw = await res.text();
+    console.log('[/players debug] status:', res.status, 'body:', raw.slice(0, 300));
+
+    if (!res.ok) {
+      return interaction.editReply(`🔴 **Server appears to be offline.** No player data available.\n\`status: ${res.status}\``);
+    }
 
     // Try to parse JSON wrapper if present
     let playerText = raw;
