@@ -33,6 +33,34 @@ const IB_GUID             = process.env.IB_GUID;
 const IB_SERVER_USERNAME  = process.env.IB_SERVER_USERNAME;
 const IB_SERVER_ID        = process.env.IB_SERVER_ID;
 
+// ── Scheduled restart times (UTC hours, matches IB scheduler) ─
+const RESTART_HOURS = [0, 6, 12, 18];
+
+function getNextRestart() {
+  const now = new Date();
+  const h = now.getUTCHours();
+  const m = now.getUTCMinutes();
+
+  // Find next restart hour today, or wrap to tomorrow
+  let nextHour = RESTART_HOURS.find(r => r > h || (r === h && m === 0));
+  const next = new Date(now);
+  next.setUTCSeconds(0, 0);
+  next.setUTCMinutes(0);
+  if (nextHour !== undefined) {
+    next.setUTCHours(nextHour);
+  } else {
+    next.setUTCDate(next.getUTCDate() + 1);
+    next.setUTCHours(RESTART_HOURS[0]);
+  }
+
+  const diffMs   = next - now;
+  const diffHrs  = Math.floor(diffMs / 3600000);
+  const diffMins = Math.floor((diffMs % 3600000) / 60000);
+  const timeStr  = `${String(next.getUTCHours()).padStart(2,'0')}:00 UTC`;
+
+  return { timeStr, diffHrs, diffMins, diffMs };
+}
+
 // ── State ────────────────────────────────────────────────────
 let voteActive    = false;
 let votes         = { yes: new Set(), no: new Set() };
@@ -120,7 +148,7 @@ function buildEmbed(status = 'active') {
       (status === 'active' ? '*You can change your vote at any time.*' : '')
     )
     .setColor(color)
-    .setFooter({ text: `Majority wins  •  Min ${MIN_VOTES} votes  •  ${VOTE_MINUTES} min window` });
+    .setFooter({ text: `Majority wins  •  Min ${MIN_VOTES} votes  •  ${VOTE_MINUTES} min window  •  Next scheduled restart: ${getNextRestart().timeStr}` });
 }
 
 // Send an in-game message via IB dashboard RCON
@@ -194,8 +222,9 @@ async function runRestartSequence(channel) {
     if (cookie && ingame) await ibServerMsg(cookie, ingame);
   }
 
+  const nextSched = getNextRestart();
   await msg(
-    '🗳️ **Vote passed!** Server restarting in **5 minutes** — find a safe spot!',
+    `🗳️ **Vote passed!** Server restarting in **5 minutes** — find a safe spot!\n📅 Next scheduled restart after this: **${nextSched.timeStr}**`,
     'Server Restart Vote Started: Restarting in 5 minutes!'
   );
 
@@ -271,6 +300,14 @@ async function registerCommands() {
       .setName('servercheck')
       .setDescription('Check if the Sanctuary PZ server is online or offline')
       .toJSON(),
+    new SlashCommandBuilder()
+      .setName('nextrestart')
+      .setDescription('Check when the next scheduled server restart is')
+      .toJSON(),
+    new SlashCommandBuilder()
+      .setName('players')
+      .setDescription('See who is currently online on the Sanctuary PZ server')
+      .toJSON(),
   ];
   const rest = new REST().setToken(DISCORD_TOKEN);
   try {
@@ -323,6 +360,15 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
 
+    // Block vote if a scheduled restart is happening soon
+    const nextR = getNextRestart();
+    if (nextR.diffMs < 15 * 60 * 1000) {
+      return interaction.reply({
+        content: `⏰ The server restarts in **${nextR.diffMins} minutes** anyway (at ${nextR.timeStr})! No need to vote.`,
+        ephemeral: true
+      });
+    }
+
     voteActive    = true;
     votes         = { yes: new Set(), no: new Set() };
     initiatorName = interaction.member?.displayName || interaction.user.username;
@@ -358,7 +404,7 @@ client.on('interactionCreate', async (interaction) => {
 
     // Announce in-game that a vote has started
     ibLogin().then(cookie => {
-      if (cookie) ibServerMsg(cookie, 'A server restart vote has started on Discord! Vote now before it closes!');
+      if (cookie) ibServerMsg(cookie, `Restart vote started! Vote on Discord in #vote-restart. Closes in ${VOTE_MINUTES} mins!`);
     }).catch(() => {});
 
     return;
@@ -405,6 +451,67 @@ client.on('interactionCreate', async (interaction) => {
     await interaction.editReply('✅ **Server Status:** Online and running!');
   } else {
     await interaction.editReply('🔴 **Server Status:** Offline or currently restarting.');
+  }
+});
+
+// ── /nextrestart command ─────────────────────────────────────
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== 'nextrestart') return;
+  const r = getNextRestart();
+  const timeLeft = r.diffHrs > 0
+    ? `${r.diffHrs}h ${r.diffMins}m`
+    : `${r.diffMins} minutes`;
+  await interaction.reply(`🕐 **Next Scheduled Restart:** ${r.timeStr} (in **${timeLeft}**)`);
+});
+
+// ── /players command ──────────────────────────────────────────
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== 'players') return;
+
+  await interaction.deferReply();
+
+  const cookie = await ibLogin();
+  if (!cookie) {
+    return interaction.editReply('❌ Could not connect to the server management panel.');
+  }
+
+  try {
+    const res = await fetch('https://dashboard.indifferentbroccoli.com/rconsend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Cookie': cookie },
+      body: JSON.stringify({ serverLinuxUsername: IB_SERVER_USERNAME, command: 'players' }),
+    });
+
+    if (!res.ok) {
+      return interaction.editReply('🔴 **Server appears to be offline.** No player data available.');
+    }
+
+    const raw = await res.text();
+
+    // Try to parse JSON wrapper if present
+    let playerText = raw;
+    try {
+      const parsed = JSON.parse(raw);
+      playerText = parsed.result || parsed.message || parsed.output || raw;
+    } catch (_) {}
+
+    if (!playerText || playerText.toLowerCase().includes('error') || playerText.toLowerCase().includes('offline')) {
+      return interaction.editReply('🔴 **Server appears to be offline.** No player data available.');
+    }
+
+    // Format nicely
+    const lines = playerText.trim().split('\n').filter(l => l.trim());
+    const header = lines[0] || 'Players connected (0):';
+    const players = lines.slice(1).map(l => l.replace(/^-/, '').trim()).filter(Boolean);
+
+    if (players.length === 0) {
+      await interaction.editReply(`👻 **No players online** right now.\n\n*${header}*`);
+    } else {
+      const list = players.map(p => `• ${p}`).join('\n');
+      await interaction.editReply(`🟢 **Players Online (${players.length}):**\n${list}`);
+    }
+  } catch (err) {
+    await interaction.editReply('❌ Could not fetch player list. Try again later.');
   }
 });
 
