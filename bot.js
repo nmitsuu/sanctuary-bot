@@ -58,7 +58,8 @@ function getNextRestart() {
   const diffMins = Math.floor((diffMs % 3600000) / 60000);
   const timeStr  = `${String(next.getUTCHours()).padStart(2,'0')}:00 UTC`;
 
-  return { timeStr, diffHrs, diffMins, diffMs };
+  const unixTs = Math.floor(next.getTime() / 1000);
+  return { timeStr: `<t:${unixTs}:t>`, fullStr: `<t:${unixTs}:F>`, diffHrs, diffMins, diffMs };
 }
 
 // ── State ────────────────────────────────────────────────────
@@ -185,9 +186,17 @@ async function ibCheckOnline(cookie) {
     });
     if (!res.ok) return false;
     const text = await res.text();
-    // If response contains error/offline indicators, server is down
-    const lower = text.toLowerCase();
-    return !lower.includes('offline') && !lower.includes('not running') && !lower.includes('error');
+
+    // Try to extract the actual result from a JSON wrapper first
+    let content = text;
+    try {
+      const parsed = JSON.parse(text);
+      // Use the actual result field, not the whole JSON (avoids false "error" key hits)
+      content = parsed.result || parsed.message || parsed.output || text;
+    } catch (_) {}
+
+    const lower = content.toLowerCase();
+    return !lower.includes('offline') && !lower.includes('not running');
   } catch {
     return false;
   }
@@ -461,7 +470,7 @@ client.on('interactionCreate', async (interaction) => {
   const timeLeft = r.diffHrs > 0
     ? `${r.diffHrs}h ${r.diffMins}m`
     : `${r.diffMins} minutes`;
-  await interaction.reply(`🕐 **Next Scheduled Restart:** ${r.timeStr} (in **${timeLeft}**)`);
+  await interaction.reply(`🕐 **Next Scheduled Restart:** ${r.timeStr} — ${r.fullStr} (in **${timeLeft}**)` );
 });
 
 // ── /players command ──────────────────────────────────────────
@@ -495,7 +504,7 @@ client.on('interactionCreate', async (interaction) => {
       playerText = parsed.result || parsed.message || parsed.output || raw;
     } catch (_) {}
 
-    if (!playerText || playerText.toLowerCase().includes('error') || playerText.toLowerCase().includes('offline')) {
+    if (!playerText || playerText.toLowerCase().includes('offline') || playerText.toLowerCase().includes('not running')) {
       return interaction.editReply('🔴 **Server appears to be offline.** No player data available.');
     }
 
@@ -504,11 +513,14 @@ client.on('interactionCreate', async (interaction) => {
     const header = lines[0] || 'Players connected (0):';
     const players = lines.slice(1).map(l => l.replace(/^-/, '').trim()).filter(Boolean);
 
+    const nextR = getNextRestart();
+    const footerLine = `\n*Next scheduled restart: ${nextR.timeStr}*`;
+
     if (players.length === 0) {
-      await interaction.editReply(`👻 **No players online** right now.\n\n*${header}*`);
+      await interaction.editReply(`👻 **No players online** right now.\n\n*${header}*${footerLine}`);
     } else {
       const list = players.map(p => `• ${p}`).join('\n');
-      await interaction.editReply(`🟢 **Players Online (${players.length}):**\n${list}`);
+      await interaction.editReply(`🟢 **Players Online (${players.length}):**\n${list}${footerLine}`);
     }
   } catch (err) {
     await interaction.editReply('❌ Could not fetch player list. Try again later.');
