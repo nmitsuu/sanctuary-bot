@@ -514,6 +514,8 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.editReply('🔴 **Server appears to be offline.** No player data available.');
     }
 
+    console.log('[/players debug] raw response:', JSON.stringify(raw.slice(0, 500)));
+
     // Empty body = server online, RCON responded but no player data = 0 players
     if (!raw || !raw.trim()) {
       return interaction.editReply('👻 **No players online** right now.');
