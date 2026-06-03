@@ -152,7 +152,7 @@ function buildEmbed(status = 'active') {
       (status === 'active' ? '*You can change your vote at any time.*' : '')
     )
     .setColor(color)
-    .setFooter({ text: `Majority wins  •  Min ${MIN_VOTES} votes  •  ${VOTE_MINUTES} min window  •  Next scheduled restart: ${getNextRestart().timeStr}` });
+    .setFooter({ text: `Majority wins  •  Min ${MIN_VOTES} votes  •  ${VOTE_MINUTES} min window  •  Next scheduled restart: ${getNextRestart().timeStr} (${getNextRestart().diffHrs > 0 ? getNextRestart().diffHrs + "h " : ""}${getNextRestart().diffMins}m)` });
 }
 
 // Send an in-game message via IB dashboard RCON
@@ -355,6 +355,11 @@ async function endVote(channel) {
       ? `Not enough votes (got **${total}**, need **${MIN_VOTES}**).`
       : `Majority voted no (**${yesCount}** yes vs **${noCount}** no).`;
     await channel.send(`❌ **Vote failed.** ${reason}`);
+    // Announce in-game so players inside know
+    try {
+      const cookie = await ibLogin();
+      if (cookie) await ibServerMsg(cookie, `Vote Failed: ${total < MIN_VOTES ? 'Not enough votes' : 'Majority voted no'} - Server will NOT restart.`);
+    } catch (_) {}
   }
 
   votes = { yes: new Set(), no: new Set() };
@@ -368,16 +373,8 @@ async function registerCommands() {
       .setDescription('Start a community vote to restart the Sanctuary PZ server')
       .toJSON(),
     new SlashCommandBuilder()
-      .setName('servercheck')
-      .setDescription('Check if the Sanctuary PZ server is online or offline')
-      .toJSON(),
-    new SlashCommandBuilder()
       .setName('nextrestart')
       .setDescription('Check when the next scheduled server restart is')
-      .toJSON(),
-    new SlashCommandBuilder()
-      .setName('players')
-      .setDescription('See who is currently online on the Sanctuary PZ server')
       .toJSON(),
   ];
   const rest = new REST().setToken(DISCORD_TOKEN);
@@ -414,7 +411,7 @@ async function buildStatusContent(cookie) {
       text: [
         '⛔️ **Server Status: Offline**',
         '',
-        `🔄 **Next Restart:** ${next.timeStr}, ${relStr}`,
+        `🔄 **Next Restart:** ${next.timeStr}, ${relStr} *(in ${next.diffHrs > 0 ? next.diffHrs + "h " : ""}${next.diffMins}m)*`,
         '',
         '*No player data available.*'
       ].join('\n')
@@ -431,7 +428,7 @@ async function buildStatusContent(cookie) {
     text: [
       '✅ **Server Status: Online**',
       '',
-      `🔄 **Next Restart:** ${next.timeStr}, ${relStr}`,
+      `🔄 **Next Restart:** ${next.timeStr}, ${relStr} *(in ${next.diffHrs > 0 ? next.diffHrs + "h " : ""}${next.diffMins}m)*`,
       '',
       `🌼 **Players Online (${count}/${maxSlots})**`,
       ...playerLines
@@ -649,7 +646,7 @@ client.on('interactionCreate', async (interaction) => {
   const r = getNextRestart();
   const timeLeft = r.diffHrs > 0
     ? `${r.diffHrs}h ${r.diffMins}m`
-    : `${r.diffMins} minutes`;
+    : `${r.diffMins}m`;
   await interaction.reply(`🕐 **Next Scheduled Restart:** ${r.timeStr} — ${r.fullStr} (in **${timeLeft}**)` );
 });
 
