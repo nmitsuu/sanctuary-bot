@@ -509,10 +509,14 @@ client.on('interactionCreate', async (interaction) => {
     });
 
     const raw = await res.text();
-    console.log('[/players debug] status:', res.status, 'body:', raw.slice(0, 300));
 
     if (!res.ok) {
-      return interaction.editReply(`🔴 **Server appears to be offline.** No player data available.\n\`status: ${res.status}\``);
+      return interaction.editReply('🔴 **Server appears to be offline.** No player data available.');
+    }
+
+    // Empty body = server online, RCON responded but no player data = 0 players
+    if (!raw || !raw.trim()) {
+      return interaction.editReply('👻 **No players online** right now.');
     }
 
     // Try to parse JSON wrapper if present
@@ -522,7 +526,7 @@ client.on('interactionCreate', async (interaction) => {
       playerText = parsed.result || parsed.message || parsed.output || raw;
     } catch (_) {}
 
-    if (!playerText || playerText.toLowerCase().includes('offline') || playerText.toLowerCase().includes('not running')) {
+    if (playerText.toLowerCase().includes('offline') || playerText.toLowerCase().includes('not running')) {
       return interaction.editReply('🔴 **Server appears to be offline.** No player data available.');
     }
 
