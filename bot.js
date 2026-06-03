@@ -259,7 +259,12 @@ async function ibGetPlayers(cookie) {
     const statusHint = html.match(/deploy_status[^"]*"[^"]*"/)?.[0] || 'not found';
     const runningHint = html.match(/data-running="[^"]*"/)?.[0] || 'not found';
     const stoppedHint = html.includes('stopped') ? 'has:stopped' : 'no:stopped';
-    console.log('[ibGetPlayers debug] maxMatch:', !!maxMatch, '| status:', statusHint, '| running:', runningHint, '|', stoppedHint);
+    // Debug: dump more context around server state
+    const deploySection = html.match(/deploy_status[\s\S]{0,500}/)?.[0]?.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').slice(0,200) || 'not found';
+    const serverMgmtSection = html.match(/Server Management[\s\S]{0,300}/)?.[0]?.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').slice(0,200) || 'not found';
+    console.log('[ibGetPlayers debug] maxMatch:', !!maxMatch);
+    console.log('[ibGetPlayers debug] deploy section:', deploySection);
+    console.log('[ibGetPlayers debug] serverMgmt section:', serverMgmtSection);
 
     if (!maxMatch) return null;
 
@@ -654,6 +659,15 @@ client.on('interactionCreate', async (interaction) => {
   } catch (err) {
     await interaction.editReply('❌ Could not fetch player list. Try again later.');
   }
+});
+
+// Prevent unhandled rejections from crashing the bot
+process.on('unhandledRejection', (err) => {
+  console.error('[Unhandled Rejection]', err?.message || err);
+});
+
+client.on('error', (err) => {
+  console.error('[Discord Client Error]', err?.message || err);
 });
 
 client.login(DISCORD_TOKEN);
