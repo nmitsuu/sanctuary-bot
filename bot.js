@@ -33,6 +33,9 @@ const IB_GUID             = process.env.IB_GUID;
 const IB_SERVER_USERNAME  = process.env.IB_SERVER_USERNAME;
 const IB_SERVER_ID        = process.env.IB_SERVER_ID;
 
+// ── Status channel config ─────────────────────────────────────
+const STATUS_CHANNEL_ID   = process.env.STATUS_CHANNEL_ID;
+
 // ── Scheduled restart times (UTC hours, matches IB scheduler) ─
 const RESTART_HOURS = [0, 6, 12, 18];
 
@@ -216,43 +219,24 @@ async function waitForServerOnline(channel) {
 // ── Get online players via RCON ───────────────────────────────
 async function ibGetPlayers(cookie) {
   try {
-    const res = await fetch('https://dashboard.indifferentbroccoli.com/', {
-      method: 'GET',
-      headers: { 'Cookie': cookie },
+    const res = await fetch('https://dashboard.indifferentbroccoli.com/rconsend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Cookie': cookie },
+      body: JSON.stringify({ serverLinuxUsername: IB_SERVER_USERNAME, command: 'players' }),
     });
     if (!res.ok) return null;
-    const html = await res.text();
+    const raw  = await res.text();
+    // Try JSON first, fall back to raw text
+    let text = raw;
+    try { const j = JSON.parse(raw); text = j.output || j.result || j.data || raw; } catch {}
 
-    // Extract max slots
-    const maxMatch = html.match(/id="players-container-[^"]*"[^>]*data-max="(\d+)"/);
-    const maxSlots = maxMatch ? parseInt(maxMatch[1]) : 16;
-
-    // Extract player list from players-list ul
-    // Each player li has: avatar letter div, then name + time divs
-    const listMatch = html.match(/id="players-list-[^"]*"([\s\S]*?)<\/ul>/);
-    const players = [];
-    if (listMatch) {
-      const listHtml = listMatch[1];
-      const liMatches = [...listHtml.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/g)];
-      for (const match of liMatches) {
-        const liHtml = match[1];
-        // Strip all tags to get raw text tokens
-        const tokens = liHtml
-          .replace(/<[^>]+>/g, '|')
-          .split('|')
-          .map(t => t.trim())
-          .filter(Boolean);
-        // tokens look like: ["m", "mitsu", "0h 42m"] - first is avatar letter, skip it
-        // Find the time token (matches pattern like "0h 42m" or "12m")
-        const timeToken = tokens.find(t => /\d+h\s*\d*m?|\d+m/.test(t)) || '';
-        // Name is the token before the time, skipping the single-char avatar
-        const nameTokens = tokens.filter(t => t !== timeToken && t.length > 1);
-        const name = nameTokens[0] || '';
-        if (name) players.push({ name, time: timeToken });
-      }
-    }
-
-    return { count: players.length, maxSlots, players };
+    const countMatch = text.match(/Players connected \((\d+)\)/i);
+    const count = countMatch ? parseInt(countMatch[1]) : 0;
+    const players = text.split('\n')
+      .filter(l => l.trim().startsWith('-'))
+      .map(l => l.trim().slice(1).trim())
+      .filter(Boolean);
+    return { count, players };
   } catch { return null; }
 }
 
@@ -260,6 +244,16 @@ async function ibGetPlayers(cookie) {
 async function runRestartSequence(channel) {
   // Login once and reuse the cookie for all IB calls
   const cookie = await ibLogin();
+
+  // Mark channel as restarting (orange)
+  if (STATUS_CHANNEL_ID) {
+    try {
+      const statusCh = await client.channels.fetch(STATUS_CHANNEL_ID);
+      if (statusCh) await statusCh.setName('🟠server-status');
+      lastChannelStatus = 'restarting';
+      if (statusMessage) await statusMessage.edit('🟠 **Server Status: Restarting...**\n\n*The server is restarting. Back soon!*');
+    } catch {}
+  }
 
   async function msg(discord, ingame) {
     await channel.send(discord);
@@ -368,9 +362,101 @@ async function registerCommands() {
 // ── Discord client ────────────────────────────────────────────
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
+// ── Live status channel ───────────────────────────────────────
+let statusMessage = null;   // the single pinned message we keep editing
+let lastChannelStatus = null; // track last known status to avoid spammy renames
+
+async function buildStatusContent(cookie) {
+  const next = getNextRestart();
+  const data = await ibGetPlayers(cookie);
+
+  if (!data) {
+    // Server offline
+    return {
+      status: 'offline',
+      text: [
+        '🔴 **Server Status: Offline**',
+        '',
+        `📅 **Next Restart:** ${next.timeStr} — <t:${next.unix}:R>`,
+        '',
+        '*No player data available.*'
+      ].join('\n')
+    };
+  }
+
+  const { count, maxSlots, players } = data;
+  const playerLines = count === 0
+    ? ['*No survivors online right now...*']
+    : players.map(p => `• **${p.name}** *(${p.time})*`);
+
+  return {
+    status: 'online',
+    text: [
+      '🟢 **Server Status: Online**',
+      '',
+      `📅 **Next Restart:** ${next.timeStr} — <t:${next.unix}:R>`,
+      '',
+      `🌼 **Players Online (${count}/${maxSlots})**`,
+      ...playerLines
+    ].join('\n')
+  };
+}
+
+async function updateStatusChannel() {
+  if (!STATUS_CHANNEL_ID) return;
+  try {
+    const channel = await client.channels.fetch(STATUS_CHANNEL_ID);
+    if (!channel) return;
+
+    const cookie = await ibLogin();
+    const { status, text } = await buildStatusContent(cookie);
+
+    // Rename channel if status changed
+    const emoji = status === 'online' ? '🟢' : status === 'offline' ? '🔴' : '🟠';
+    const baseName = 'server-status';
+    if (status !== lastChannelStatus) {
+      try {
+        await channel.setName(`${emoji}${baseName}`);
+        lastChannelStatus = status;
+      } catch (e) {
+        console.log('[Status] Channel rename skipped (rate limit?)');
+      }
+    }
+
+    // Edit existing message or post new one
+    if (statusMessage) {
+      try {
+        await statusMessage.edit(text);
+      } catch {
+        statusMessage = null; // message was deleted, repost
+      }
+    }
+
+    if (!statusMessage) {
+      // Clear old messages and post fresh
+      const messages = await channel.messages.fetch({ limit: 10 });
+      const botMessages = messages.filter(m => m.author.id === client.user.id);
+      for (const [, msg] of botMessages) {
+        try { await msg.delete(); } catch {}
+      }
+      statusMessage = await channel.send(text);
+    }
+
+  } catch (err) {
+    console.error('[Status] Error updating status channel:', err.message);
+  }
+}
+
 client.once('ready', async () => {
   console.log(`✅ Sanctuary Bot online as ${client.user.tag}`);
   await registerCommands();
+
+  // Start live status channel updater
+  if (STATUS_CHANNEL_ID) {
+    await updateStatusChannel();                        // immediate first update
+    setInterval(updateStatusChannel, 2 * 60 * 1000);   // then every 2 minutes
+    console.log('✅ Status channel updater started!');
+  }
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -521,19 +607,39 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   try {
-    const data = await ibGetPlayers(cookie);
+    const res = await fetch('https://dashboard.indifferentbroccoli.com/rconsend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Cookie': cookie },
+      body: JSON.stringify({ serverLinuxUsername: IB_SERVER_USERNAME, command: 'players' }),
+    });
 
-    if (!data) {
+    if (!res.ok) {
       return interaction.editReply('🔴 **Server appears to be offline.** No player data available.');
     }
 
-    const { count, maxSlots, players } = data;
+    const raw = await res.text();
 
-    if (count === 0) {
-      await interaction.editReply(`🌼 **Players Online (0/${maxSlots})**\n\n*No survivors online right now...*`);
+    // Try to parse JSON wrapper if present
+    let playerText = raw;
+    try {
+      const parsed = JSON.parse(raw);
+      playerText = parsed.result || parsed.message || parsed.output || raw;
+    } catch (_) {}
+
+    if (!playerText || playerText.toLowerCase().includes('offline') || playerText.toLowerCase().includes('not running')) {
+      return interaction.editReply('🔴 **Server appears to be offline.** No player data available.');
+    }
+
+    // Format nicely
+    const lines = playerText.trim().split('\n').filter(l => l.trim());
+    const header = lines[0] || 'Players connected (0):';
+    const players = lines.slice(1).map(l => l.replace(/^-/, '').trim()).filter(Boolean);
+
+    if (players.length === 0) {
+      await interaction.editReply(`👻 **No players online** right now.\n\n*${header}*`);
     } else {
-      const list = players.map(p => `┃ **${p.name}** *(${p.time})*`).join('\n');
-      await interaction.editReply(`🌼 **Players Online (${count}/${maxSlots})**\n\n${list}`);
+      const list = players.map(p => `• ${p}`).join('\n');
+      await interaction.editReply(`🟢 **Players Online (${players.length}):**\n${list}`);
     }
   } catch (err) {
     await interaction.editReply('❌ Could not fetch player list. Try again later.');
