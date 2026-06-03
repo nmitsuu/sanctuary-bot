@@ -392,6 +392,55 @@ async function registerCommands() {
 // ── Discord client ────────────────────────────────────────────
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
+// ── Scheduled restart warnings ───────────────────────────────
+const warnedRestarts = new Set(); // track which warnings we've already sent
+
+async function checkScheduledRestartWarnings() {
+  const { diffMs, diffHrs, diffMins, timeStr } = getNextRestart();
+  const diffTotalMins = Math.floor(diffMs / 60000);
+
+  // Warning thresholds in minutes
+  const warnings = [
+    { mins: 30, label: '30 minutes' },
+    { mins: 10, label: '10 minutes' },
+  ];
+
+  for (const { mins, label } of warnings) {
+    // Fire if within the target window (within 1 minute of threshold)
+    if (diffTotalMins <= mins && diffTotalMins > mins - 1) {
+      const key = `${timeStr}-${mins}`;
+      if (warnedRestarts.has(key)) continue; // already sent this one
+      warnedRestarts.add(key);
+
+      // Clean up old keys to avoid memory leak
+      if (warnedRestarts.size > 20) warnedRestarts.clear();
+
+      console.log(`[Restart Warning] Sending ${label} warning`);
+
+      // Post in announce channel (no ping)
+      try {
+        const announceChannel = await client.channels.fetch(ANNOUNCE_CHANNEL_ID);
+        if (announceChannel) {
+          await announceChannel.send(
+            `🔄 **Scheduled server restart in ${label}!** ${timeStr}
+*Find a safe spot to log out. The server will be back up shortly.*`
+          );
+        }
+      } catch (e) {
+        console.error('[Restart Warning] Discord post failed:', e.message);
+      }
+
+      // Send in-game message
+      try {
+        const cookie = await ibLogin();
+        if (cookie) await ibServerMsg(cookie, `Scheduled restart in ${label}! Find a safe spot to log out.`);
+      } catch (e) {
+        console.error('[Restart Warning] In-game message failed:', e.message);
+      }
+    }
+  }
+}
+
 // ── Live status channel ───────────────────────────────────────
 let statusMessage = null;   // the single pinned message we keep editing
 let lastChannelStatus = null; // track last known status to avoid spammy renames
@@ -511,6 +560,10 @@ client.once('ready', async () => {
     setInterval(updateStatusChannel, 30 * 1000);   // then every 30 seconds
     console.log('✅ Status channel updater started!');
   }
+
+  // Start scheduled restart warning checker (runs every minute)
+  setInterval(checkScheduledRestartWarnings, 60 * 1000);
+  console.log('✅ Scheduled restart warning checker started!');
 });
 
 client.on('interactionCreate', async (interaction) => {
