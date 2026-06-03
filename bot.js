@@ -186,17 +186,9 @@ async function ibCheckOnline(cookie) {
     });
     if (!res.ok) return false;
     const text = await res.text();
-
-    // Try to extract the actual result from a JSON wrapper first
-    let content = text;
-    try {
-      const parsed = JSON.parse(text);
-      // Use the actual result field, not the whole JSON (avoids false "error" key hits)
-      content = parsed.result || parsed.message || parsed.output || text;
-    } catch (_) {}
-
-    const lower = content.toLowerCase();
-    return !lower.includes('offline') && !lower.includes('not running');
+    // If response contains error/offline indicators, server is down
+    const lower = text.toLowerCase();
+    return !lower.includes('offline') && !lower.includes('not running') && !lower.includes('error');
   } catch {
     return false;
   }
@@ -219,6 +211,31 @@ async function waitForServerOnline(channel) {
     }
   }
   await channel.send('⚠️ Server is taking longer than expected. Please check the IB dashboard manually.');
+}
+
+// ── Get online players via RCON ───────────────────────────────
+async function ibGetPlayers(cookie) {
+  try {
+    const res = await fetch('https://dashboard.indifferentbroccoli.com/rconsend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Cookie': cookie },
+      body: JSON.stringify({ serverLinuxUsername: IB_SERVER_USERNAME, command: 'players' }),
+    });
+    if (!res.ok) return null;
+    const raw  = await res.text();
+    // Try JSON first, fall back to raw text
+    let text = raw;
+    try { const j = JSON.parse(raw); text = j.output || j.result || j.data || raw; } catch {}
+
+    const countMatch = text.match(/Players connected \((\d+)\)/i);
+    const count = countMatch ? parseInt(countMatch[1]) : 0;
+    const players = text.split('
+')
+      .filter(l => l.trim().startsWith('-'))
+      .map(l => l.trim().slice(1).trim())
+      .filter(Boolean);
+    return { count, players };
+  } catch { return null; }
 }
 
 // ── Restart sequence (runs after vote passes) ─────────────────
@@ -444,6 +461,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
+
 // ── /servercheck command ─────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand() || interaction.commandName !== 'servercheck') return;
@@ -513,14 +531,11 @@ client.on('interactionCreate', async (interaction) => {
     const header = lines[0] || 'Players connected (0):';
     const players = lines.slice(1).map(l => l.replace(/^-/, '').trim()).filter(Boolean);
 
-    const nextR = getNextRestart();
-    const footerLine = `\n*Next scheduled restart: ${nextR.timeStr}*`;
-
     if (players.length === 0) {
-      await interaction.editReply(`👻 **No players online** right now.\n\n*${header}*${footerLine}`);
+      await interaction.editReply(`👻 **No players online** right now.\n\n*${header}*`);
     } else {
       const list = players.map(p => `• ${p}`).join('\n');
-      await interaction.editReply(`🟢 **Players Online (${players.length}):**\n${list}${footerLine}`);
+      await interaction.editReply(`🟢 **Players Online (${players.length}):**\n${list}`);
     }
   } catch (err) {
     await interaction.editReply('❌ Could not fetch player list. Try again later.');
