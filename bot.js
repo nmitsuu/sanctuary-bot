@@ -217,10 +217,9 @@ async function updateStatusChannel(guild) {
       }
     }
 
-    // No existing message — post a new one and pin it
+    // No existing message — post a new one
     const sent = await channel.send({ embeds: [embed] });
     statusMessageId = sent.id;
-    try { await sent.pin(); } catch {}
 
   } catch (err) {
     console.error('[Status] Update failed:', err.message);
