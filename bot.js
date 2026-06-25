@@ -98,39 +98,49 @@ async function ibServerMsg(cookie, text) {
   } catch (err) { console.error('[IB RCON]', err.message); return false; }
 }
 
+// Scrape IB dashboard HTML to get player list and online status
 async function ibGetPlayers(cookie) {
   try {
-    const res = await fetch('https://dashboard.indifferentbroccoli.com/rconsend', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Cookie': cookie },
-      body: JSON.stringify({ serverLinuxUsername: IB_SERVER_USERNAME, command: 'players' }),
+    const res = await fetch('https://dashboard.indifferentbroccoli.com/', {
+      method: 'GET',
+      headers: { 'Cookie': cookie },
     });
     if (!res.ok) return null;
-    const raw = await res.text();
-    let text = raw;
-    try { const j = JSON.parse(raw); text = j.output || j.result || j.data || raw; } catch {}
-    const countMatch = text.match(/Players connected \((\d+)\)/i);
-    const count = countMatch ? parseInt(countMatch[1]) : 0;
-    const players = text.split('\n')
-      .filter(l => l.trim().startsWith('-'))
-      .map(l => l.trim().slice(1).trim())
-      .filter(Boolean);
-    return { count, players };
+    const html = await res.text();
+
+    // Check if server shows as offline in the HTML
+    const offlineMatch = html.match(/id="EuCM3ZAXFPKJ_monitor_statusText"[^>]*>([^<]*)<\/span>/i);
+    if (offlineMatch && offlineMatch[1].trim().toLowerCase() === 'offline') {
+      return { online: false, count: 0, players: [] };
+    }
+
+    // Get player list from the players-list element
+    const listMatch = html.match(/id="players-list-EuCM3ZAXFPKJ"([\s\S]*?)<\/ul>/);
+    const players = [];
+    if (listMatch) {
+      const listHtml = listMatch[1];
+      const liMatches = [...listHtml.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/g)];
+      for (const match of liMatches) {
+        const tokens = match[1]
+          .replace(/<[^>]+>/g, '|')
+          .split('|')
+          .map(t => t.trim())
+          .filter(Boolean);
+        // tokens: [avatar_letter, name, time_online]
+        const timeToken = tokens.find(t => /\d+h\s*\d*m?|\d+m/.test(t)) || '';
+        const nameTokens = tokens.filter(t => t !== timeToken && t.length > 1);
+        const name = nameTokens[0] || '';
+        if (name) players.push({ name, time: timeToken });
+      }
+    }
+
+    return { online: true, count: players.length, players };
   } catch { return null; }
 }
 
 async function ibCheckOnline(cookie) {
-  try {
-    const res = await fetch('https://dashboard.indifferentbroccoli.com/rconsend', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Cookie': cookie },
-      body: JSON.stringify({ serverLinuxUsername: IB_SERVER_USERNAME, command: 'players' }),
-    });
-    if (!res.ok) return false;
-    const text = await res.text();
-    const lower = text.toLowerCase();
-    return !lower.includes('offline') && !lower.includes('not running') && !lower.includes('error');
-  } catch { return false; }
+  const data = await ibGetPlayers(cookie);
+  return data ? data.online : false;
 }
 
 // ── Status channel update ─────────────────────────────────────
@@ -142,7 +152,7 @@ async function updateStatusChannel(guild) {
     const cookie = await ibLogin();
     if (!cookie) return;
 
-    const online = await ibCheckOnline(cookie);
+    const playerData = await ibGetPlayers(cookie);
     const nextR  = getNextRestart();
 
     let description = '';
@@ -150,10 +160,9 @@ async function updateStatusChannel(guild) {
     let statusLine = '🔴 **Server Offline**';
     let channelEmoji = '🔴';
 
-    if (online) {
-      const playerData = await ibGetPlayers(cookie);
-      const count   = playerData?.count ?? 0;
-      const players = playerData?.players ?? [];
+    if (playerData?.online) {
+      const count   = playerData.count ?? 0;
+      const players = playerData.players ?? [];
 
       color       = 0x5c8c5a;
       channelEmoji = count > 0 ? '🟢' : '🟠';
@@ -162,7 +171,7 @@ async function updateStatusChannel(guild) {
         : '🟠 **Server Online** — No survivors online';
 
       const playerList = players.length > 0
-        ? players.map(p => `• ${p}`).join('\n')
+        ? players.map(p => `• ${p.name}${p.time ? ` — ${p.time}` : ''}`).join('\n')
         : '*No survivors currently online*';
 
       description = [
