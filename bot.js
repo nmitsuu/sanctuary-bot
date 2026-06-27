@@ -52,7 +52,9 @@ function getNextRestart() {
   const diffHrs  = Math.floor(diffMs / 3600000);
   const diffMins = Math.floor((diffMs % 3600000) / 60000);
   const unixTs   = Math.floor(next.getTime() / 1000);
-  return { timeStr: `<t:${unixTs}:t>`, fullStr: `<t:${unixTs}:F>`, diffHrs, diffMins, diffMs, unix: unixTs };
+  // Plain UTC time string for footers (Discord doesn't render <t:> in embed footers)
+  const plainTime = next.toUTCString().match(/(\d{2}:\d{2})/)?.[1] + ' UTC' || '';
+  return { timeStr: `<t:${unixTs}:t>`, fullStr: `<t:${unixTs}:F>`, plainTime, diffHrs, diffMins, diffMs, unix: unixTs };
 }
 
 // ── State ─────────────────────────────────────────────────────
@@ -60,8 +62,10 @@ let voteActive    = false;
 let votes         = { yes: new Set(), no: new Set() };
 let voteMessage   = null;
 let initiatorName = '';
+let voteInitiatorId = null;
 let voteTimeout   = null;
 const userCooldowns = new Map();
+const userFailedAttempts = new Map(); // userId -> count of failed votes before cooldown
 let statusMessageId = null;
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -98,7 +102,7 @@ async function ibServerMsg(cookie, text) {
   } catch (err) { console.error('[IB RCON]', err.message); return false; }
 }
 
-// Scrape IB dashboard HTML to get player list and online status
+// ── Get online players by scraping IB dashboard HTML ─────────
 async function ibGetPlayers(cookie) {
   try {
     const res = await fetch('https://dashboard.indifferentbroccoli.com/', {
@@ -108,39 +112,45 @@ async function ibGetPlayers(cookie) {
     if (!res.ok) return null;
     const html = await res.text();
 
-    // Check if server shows as offline in the HTML
-    const offlineMatch = html.match(/id="EuCM3ZAXFPKJ_monitor_statusText"[^>]*>([^<]*)<\/span>/i);
-    if (offlineMatch && offlineMatch[1].trim().toLowerCase() === 'offline') {
-      return { online: false, count: 0, players: [] };
-    }
+    // Detect server offline via the monitor status element
+    const statusMatch = html.match(/id="[^"]*_monitor_statusText">([^<]+)<\/span>/);
+    const serverStatus = statusMatch ? statusMatch[1].trim() : 'Unknown';
+    const isOffline = serverStatus === 'Offline' || serverStatus === 'Stopped';
 
-    // Get player list from the players-list element
-    const listMatch = html.match(/id="players-list-EuCM3ZAXFPKJ"([\s\S]*?)<\/ul>/);
+    // Extract max slots
+    const maxMatch = html.match(/id="players-container-[^"]*"[^>]*data-max="(\d+)"/);
+    const maxSlots = maxMatch ? parseInt(maxMatch[1]) : 16;
+
+    if (!maxMatch && isOffline) return { count: 0, maxSlots: 16, players: [], isOffline: true };
+    if (!maxMatch) return null;
+
+    // Extract player list — each li has avatar letter div, then name + time
+    const listMatch = html.match(/id="players-list-[^"]*"([\s\S]*?)<\/ul>/);
     const players = [];
     if (listMatch) {
-      const listHtml = listMatch[1];
-      const liMatches = [...listHtml.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/g)];
+      const liMatches = [...listMatch[1].matchAll(/<li[^>]*>([\s\S]*?)<\/li>/g)];
       for (const match of liMatches) {
         const tokens = match[1]
           .replace(/<[^>]+>/g, '|')
           .split('|')
           .map(t => t.trim())
           .filter(Boolean);
-        // tokens: [avatar_letter, name, time_online]
-        const timeToken = tokens.find(t => /\d+h\s*\d*m?|\d+m/.test(t)) || '';
+        // Time token looks like "0h 42m" or "5m"
+        const timeToken = tokens.find(t => /^\d+h\s*\d*m?$|^\d+m$/.test(t)) || '';
+        // Require BOTH name AND time — prevents avatar letter being counted as a player
         const nameTokens = tokens.filter(t => t !== timeToken && t.length > 1);
         const name = nameTokens[0] || '';
-        if (name) players.push({ name, time: timeToken });
+        if (name && timeToken) players.push({ name, time: timeToken });
       }
     }
 
-    return { online: true, count: players.length, players };
+    return { count: players.length, maxSlots, players, isOffline };
   } catch { return null; }
 }
 
 async function ibCheckOnline(cookie) {
   const data = await ibGetPlayers(cookie);
-  return data ? data.online : false;
+  return data ? !data.isOffline : false;
 }
 
 // ── Status channel update ─────────────────────────────────────
@@ -160,7 +170,7 @@ async function updateStatusChannel(guild) {
     let statusLine = '🔴 **Server Offline**';
     let channelEmoji = '🔴';
 
-    if (playerData?.online) {
+    if (playerData && !playerData.isOffline) {
       const count   = playerData.count ?? 0;
       const players = playerData.players ?? [];
 
@@ -244,27 +254,14 @@ function buildEmbed(status = 'active') {
       (status === 'active' ? '*You can change your vote at any time.*' : '')
     )
     .setColor(color)
-    .setFooter({ text: `Min ${MIN_VOTES} vote  •  ${VOTE_MINUTES} min window  •  Next restart: ${getNextRestart().timeStr}` });
+    .setFooter({ text: `Min ${MIN_VOTES} vote  •  ${VOTE_MINUTES} min window  •  Next restart: ${getNextRestart().plainTime}` });
 }
 
-// ── Restart sequence ──────────────────────────────────────────
-async function runRestartSequence(channel) {
+// ── Restart sequence (instant) ───────────────────────────────
+async function runRestartSequence(channel, whoRestarted) {
   const cookie = await ibLogin();
-  async function msg(discord, ingame) {
-    await channel.send(discord);
-    if (cookie && ingame) await ibServerMsg(cookie, ingame);
-  }
-  const nextSched = getNextRestart();
-  await msg(
-    `🗳️ **Vote passed!** Server restarting in **5 minutes** — find a safe spot!\n📅 Next scheduled restart after this: **${nextSched.timeStr}**`,
-    'Server Restart Vote Passed: Restarting in 5 minutes!'
-  );
-  await sleep(2 * 60 * 1000);
-  await msg('⏰ **3 minutes** until restart.', 'Server restarting in 3 minutes!');
-  await sleep(2 * 60 * 1000);
-  await msg('⏰ **1 minute** until restart! Find shelter now!', 'Server restarting in 1 minute!');
-  await sleep(60 * 1000);
-  await msg('🔄 **Restarting now...**', 'Server is restarting now.');
+  await channel.send(`**Server is being restarted by ${whoRestarted}.**`);
+  if (cookie) await ibServerMsg(cookie, 'Server is restarting now.');
   try {
     const body = new URLSearchParams({
       guid: IB_GUID,
@@ -287,7 +284,7 @@ async function runRestartSequence(channel) {
 async function waitForServerOnline(channel) {
   const cookie = await ibLogin();
   if (!cookie) return;
-  await channel.send('⏳ Waiting for server to come back online...');
+  await channel.send('Waiting for server to come back online...');
   for (let i = 0; i < 20; i++) {
     await sleep(30 * 1000);
     if (await ibCheckOnline(cookie)) {
@@ -311,7 +308,9 @@ async function endVote(channel) {
     try { await voteMessage.edit({ embeds: [buildEmbed(passed ? 'passed' : 'failed')], components: [] }); } catch {}
   }
   if (passed) {
-    await runRestartSequence(channel);
+    await runRestartSequence(channel, initiatorName);
+    // Successful vote — no cooldown needed (server is restarting)
+    userFailedAttempts.delete(voteInitiatorId);
   } else {
     const reason = total < MIN_VOTES
       ? `Not enough votes (got **${total}**, need **${MIN_VOTES}**).`
@@ -321,8 +320,50 @@ async function endVote(channel) {
       const cookie = await ibLogin();
       if (cookie) await ibServerMsg(cookie, 'Vote Failed: Server will NOT restart.');
     } catch {}
+
+    // Track failed attempts — 2 allowed before 30 min cooldown kicks in
+    if (voteInitiatorId) {
+      const attempts = (userFailedAttempts.get(voteInitiatorId) || 0) + 1;
+      userFailedAttempts.set(voteInitiatorId, attempts);
+      if (attempts >= 2) {
+        userCooldowns.set(voteInitiatorId, Date.now() + COOLDOWN_MINUTES * 60 * 1000);
+        userFailedAttempts.delete(voteInitiatorId);
+      }
+    }
   }
   votes = { yes: new Set(), no: new Set() };
+  voteInitiatorId = null;
+}
+
+// ── Start a vote (shared by command + confirmation) ──────────
+async function startVote(interaction) {
+  voteActive    = true;
+  votes         = { yes: new Set(), no: new Set() };
+  initiatorName = interaction.member?.displayName || interaction.user.username;
+  voteInitiatorId = interaction.user.id;
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('vote_yes').setLabel('✅  Yes, restart!').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('vote_no').setLabel('❌  No, keep going').setStyle(ButtonStyle.Danger),
+  );
+
+  const channel = interaction.guild.channels.cache.get(VOTE_CHANNEL_ID);
+
+  // If this came from a slash command, reply with the vote embed directly.
+  // If it came from a confirmation button (already updated), send to channel.
+  if (interaction.isChatInputCommand && interaction.isChatInputCommand()) {
+    await interaction.reply({ embeds: [buildEmbed('active')], components: [row] });
+    voteMessage = await interaction.fetchReply();
+  } else {
+    voteMessage = await channel.send({ embeds: [buildEmbed('active')], components: [row] });
+  }
+
+  voteTimeout = setTimeout(() => endVote(channel), VOTE_MINUTES * 60 * 1000);
+
+  // In-game notice
+  ibLogin().then(cookie => {
+    if (cookie) ibServerMsg(cookie, `Restart vote started! Vote on Discord. Closes in ${VOTE_MINUTES} mins!`);
+  }).catch(() => {});
 }
 
 // ── Register commands ─────────────────────────────────────────
@@ -382,35 +423,32 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
 
+    // If a scheduled restart is coming soon, ASK for confirmation instead of blocking
     const nextR = getNextRestart();
     if (nextR.diffMs < 15 * 60 * 1000) {
-      return interaction.reply({ content: `⏰ The server restarts in **${nextR.diffMins} minutes** anyway (at ${nextR.timeStr})! No need to vote.`, ephemeral: true });
+      const confirmRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('confirm_restart_yes').setLabel('Yes, restart now').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('confirm_restart_no').setLabel('No, cancel').setStyle(ButtonStyle.Danger),
+      );
+      return interaction.reply({
+        content: `A scheduled restart is happening in **${nextR.diffMins} minute(s)**. Are you sure you want to restart now?`,
+        components: [confirmRow],
+        ephemeral: true,
+      });
     }
 
-    userCooldowns.set(interaction.user.id, Date.now() + COOLDOWN_MINUTES * 60 * 1000);
-    voteActive    = true;
-    votes         = { yes: new Set(), no: new Set() };
-    initiatorName = interaction.member?.displayName || interaction.user.username;
+    await startVote(interaction);
+    return;
+  }
 
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('vote_yes').setLabel('✅  Yes, restart!').setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId('vote_no').setLabel('❌  No, keep going').setStyle(ButtonStyle.Danger),
-    );
-
-    await interaction.reply({ embeds: [buildEmbed('active')], components: [row] });
-    voteMessage = await interaction.fetchReply();
-
-    // Ping in general/announce channel
-    const announceChannel = interaction.guild.channels.cache.get(ANNOUNCE_CHANNEL_ID);
-    if (announceChannel) {
-      const roleMention = ANNOUNCE_ROLE_ID ? `<@&${ANNOUNCE_ROLE_ID}>` : '';
-      announceChannel.send({
-        content: `${roleMention} 🗳️ **A server restart vote has started!** Head to <#${VOTE_CHANNEL_ID}> to vote. Closes in ${VOTE_MINUTES} minutes.`,
-        allowedMentions: { roles: ANNOUNCE_ROLE_ID ? [ANNOUNCE_ROLE_ID] : [] }
-      }).catch(() => {});
+  // ── Confirm-restart buttons (when scheduled restart is near) ──
+  if (interaction.isButton() && ['confirm_restart_yes', 'confirm_restart_no'].includes(interaction.customId)) {
+    if (interaction.customId === 'confirm_restart_no') {
+      return interaction.update({ content: 'Restart cancelled.', components: [] });
     }
-
-    voteTimeout = setTimeout(() => endVote(interaction.channel), VOTE_MINUTES * 60 * 1000);
+    await interaction.update({ content: 'Starting restart vote...', components: [] });
+    await startVote(interaction);
+    return;
 
     ibLogin().then(cookie => {
       if (cookie) ibServerMsg(cookie, `Restart vote started! Vote on Discord. Closes in ${VOTE_MINUTES} mins!`);
@@ -425,6 +463,16 @@ client.on('interactionCreate', async (interaction) => {
     const isYes  = interaction.customId === 'vote_yes';
     if (isYes) { votes.yes.add(userId); votes.no.delete(userId); }
     else        { votes.no.add(userId);  votes.yes.delete(userId); }
+
+    // INSTANT pass: if yes-votes meet the minimum and outweigh no-votes, end immediately
+    const yesCount = votes.yes.size;
+    const noCount  = votes.no.size;
+    if (isYes && yesCount >= MIN_VOTES && yesCount > noCount) {
+      await interaction.reply({ content: 'Vote passed — restarting now!', ephemeral: true });
+      await endVote(interaction.channel);
+      return;
+    }
+
     if (voteMessage) {
       try { await voteMessage.edit({ embeds: [buildEmbed('active')], components: voteMessage.components }); } catch {}
     }
