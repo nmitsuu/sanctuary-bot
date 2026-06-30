@@ -9,7 +9,9 @@ const {
   REST,
   Routes,
   SlashCommandBuilder,
+  UserSelectMenuBuilder,
 } = require('discord.js');
+const http = require('http');
 
 // ── Config ────────────────────────────────────────────────────
 const DISCORD_TOKEN       = process.env.DISCORD_TOKEN;
@@ -24,6 +26,9 @@ const STATUS_CHANNEL_ID   = '1196857209640988803';
 const SURVIVOR_ROLE_ID    = process.env.SURVIVOR_ROLE_ID;   // @Sanctuary Survivor role ID
 const APPS_SCRIPT_URL     = process.env.APPS_SCRIPT_URL;    // Google Apps Script web app URL
 const APPROVE_CHANNEL_ID  = process.env.APPROVE_CHANNEL_ID; // channel where /approve confirmations post (optional)
+const APPLICATIONS_CHANNEL_ID = process.env.APPLICATIONS_CHANNEL_ID; // channel where new application cards post
+const APP_NOTIFY_SECRET   = process.env.APP_NOTIFY_SECRET || 'sanctuary'; // shared secret so only your Apps Script can post
+const PORT                = process.env.PORT || 3000;
 const SERVER_IP           = process.env.SERVER_IP   || '172.240.71.145';
 const SERVER_PORT         = process.env.SERVER_PORT || '27665';
 const MIN_VOTES           = parseInt(process.env.MIN_VOTES)   || 1;
@@ -74,6 +79,11 @@ let voteTimeout   = null;
 const userCooldowns = new Map();
 const userFailedAttempts = new Map(); // userId -> count of failed votes before cooldown
 let statusMessageId = null;
+
+// Pending applications waiting to be approved: messageId -> {ign, password, discord, sheetRow}
+const pendingApplications = new Map();
+// When admin clicks "Add Player" and picks a user: stores selection for the approve step
+const pendingApprovals = new Map(); // messageId -> {ign, password, sheetRow, userId}
 
 // ── Helpers ───────────────────────────────────────────────────
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -433,6 +443,77 @@ async function registerCommands() {
 // ── Discord client ────────────────────────────────────────────
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
 
+// ── Post a new application card with an "Add Player" button ───
+async function postApplicationCard(app) {
+  const channel = client.channels.cache.get(APPLICATIONS_CHANNEL_ID);
+  if (!channel) { console.error('[App] Applications channel not found'); return; }
+
+  const adduserCmd = `/adduser ${app.username} ${app.password}`;
+
+  const embed = new EmbedBuilder()
+    .setTitle('📩 New Whitelist Application')
+    .setColor(0xc8a96e)
+    .setDescription(
+      `**Discord (typed):** ${app.discord || 'Unknown'}\n` +
+      `**In-game Name:** ${app.username}\n` +
+      (app.extra && app.extra !== '—' ? `\n**Notes:** ${app.extra}\n` : '') +
+      `\n**▶ STEP 1 — paste in the in-game console:**\n` +
+      '```' + adduserCmd + '```' +
+      `\n**▶ STEP 2 — click the button below** to DM their login & give them the Survivor role.`
+    )
+    .setFooter({ text: 'Sanctuary · click Add Player once added in-game' });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('app_addplayer')
+      .setLabel('✅ Add Player')
+      .setStyle(ButtonStyle.Success)
+  );
+
+  const msg = await channel.send({
+    content: '@here new application!',
+    embeds: [embed],
+    components: [row],
+    allowedMentions: { parse: ['everyone'] }
+  });
+
+  pendingApplications.set(msg.id, {
+    ign:      app.username,
+    password: app.password,
+    discord:  app.discord,
+    sheetRow: app.sheetRow || null,
+  });
+}
+
+// ── Do the actual approval: DM + role + mark sheet ───────────
+async function doApproval(guild, userId, ign, password, sheetRow, approverName) {
+  const result = { dmOk: true, roleOk: true };
+
+  try {
+    const user = await client.users.fetch(userId);
+    const dm = `🌸 Hello! Here are your login details:\n\n` +
+      `**Username:** ${ign}\n` +
+      `**Password:** ${password}\n\n` +
+      `**IP:** ${SERVER_IP}\n` +
+      `**Port:** ${SERVER_PORT}\n\n` +
+      `Please let us know if you need anything! 🙇‍♀️`;
+    await user.send(dm);
+  } catch { result.dmOk = false; }
+
+  try {
+    const member = await guild.members.fetch(userId);
+    await member.roles.add(SURVIVOR_ROLE_ID);
+  } catch { result.roleOk = false; }
+
+  if (sheetRow) {
+    try {
+      await fetch(`${APPS_SCRIPT_URL}?action=markadded&row=${sheetRow}&admin=${encodeURIComponent(approverName)}`);
+    } catch {}
+  }
+
+  return result;
+}
+
 client.once('ready', async () => {
   console.log(`✅ Sanctuary Bunny online as ${client.user.tag}`);
   await registerCommands();
@@ -443,9 +524,111 @@ client.once('ready', async () => {
     await updateStatusChannel(guild);
     setInterval(() => updateStatusChannel(guild), STATUS_INTERVAL_MS);
   }
+
+  // HTTP server — lets the Google Apps Script notify the bot of new applications
+  http.createServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/new-application') {
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', async () => {
+        try {
+          const data = JSON.parse(body);
+          if (data.secret !== APP_NOTIFY_SECRET) {
+            res.writeHead(403); res.end('forbidden'); return;
+          }
+          await postApplicationCard({
+            username: data.username,
+            password: data.password,
+            discord:  data.discord,
+            extra:    data.extra,
+            sheetRow: data.sheetRow,
+          });
+          res.writeHead(200); res.end('ok');
+        } catch (err) {
+          console.error('[App HTTP] error:', err.message);
+          res.writeHead(400); res.end('bad request');
+        }
+      });
+    } else {
+      res.writeHead(200); res.end('Sanctuary Bunny is alive');
+    }
+  }).listen(PORT, () => console.log(`🌐 HTTP listening on ${PORT}`));
 });
 
 client.on('interactionCreate', async (interaction) => {
+
+  // ── Application: "Add Player" button → show user picker ───
+  if (interaction.isButton() && interaction.customId === 'app_addplayer') {
+    if (!(await isAdmin(interaction.member))) {
+      return interaction.reply({ content: '❌ Only admins can approve applicants.', ephemeral: true });
+    }
+    const app = pendingApplications.get(interaction.message.id);
+    if (!app) {
+      return interaction.reply({ content: '⚠️ This application card is no longer active. Use /approve manually.', ephemeral: true });
+    }
+
+    // Show a user-select dropdown to pick which Discord member this is
+    const menu = new UserSelectMenuBuilder()
+      .setCustomId(`app_pickuser:${interaction.message.id}`)
+      .setPlaceholder('Pick the Discord member who applied')
+      .setMinValues(1).setMaxValues(1);
+
+    await interaction.reply({
+      content: `Who is **${app.discord || app.ign}**? Pick them below — then I'll DM their login & give the Survivor role.`,
+      components: [new ActionRowBuilder().addComponents(menu)],
+      ephemeral: true,
+    });
+    return;
+  }
+
+  // ── Application: user picked from dropdown → approve ──────
+  if (interaction.isUserSelectMenu() && interaction.customId.startsWith('app_pickuser:')) {
+    const appMsgId = interaction.customId.split(':')[1];
+    const app = pendingApplications.get(appMsgId);
+    if (!app) {
+      return interaction.update({ content: '⚠️ This application is no longer active.', components: [] });
+    }
+    const pickedUserId = interaction.values[0];
+    const approverName = interaction.member?.displayName || interaction.user.username;
+
+    await interaction.update({ content: '⏳ Approving...', components: [] });
+
+    const result = await doApproval(
+      interaction.guild, pickedUserId, app.ign, app.password, app.sheetRow, approverName
+    );
+
+    // Public confirmation
+    const confirmMsg =
+      `✅ **<@${pickedUserId}> has been approved!**\n` +
+      `${result.dmOk ? '• DM\'d their login info' : '• ⚠️ Could NOT DM them (they may have DMs off)'}\n` +
+      `${result.roleOk ? '• Given the Survivor role' : '• ⚠️ Could NOT assign the role'}\n` +
+      `• Approved by **${approverName}**`;
+
+    const publicChannel = APPROVE_CHANNEL_ID
+      ? interaction.guild.channels.cache.get(APPROVE_CHANNEL_ID)
+      : interaction.channel;
+    if (publicChannel) publicChannel.send(confirmMsg).catch(() => {});
+
+    // Update the original card to show it's handled + remove the button
+    try {
+      const appMsg = await interaction.channel.messages.fetch(appMsgId);
+      const oldEmbed = appMsg.embeds[0];
+      const doneEmbed = EmbedBuilder.from(oldEmbed)
+        .setColor(0x5c8c5a)
+        .setFooter({ text: `✅ Approved by ${approverName}` });
+      await appMsg.edit({ embeds: [doneEmbed], components: [] });
+    } catch {}
+
+    pendingApplications.delete(appMsgId);
+
+    await interaction.editReply({
+      content: (result.dmOk && result.roleOk)
+        ? '✅ Done! They were DM\'d and given access.'
+        : '⚠️ Partially done — see the confirmation message for what failed.',
+      components: [],
+    });
+    return;
+  }
 
   // ── /voterestart ─────────────────────────────────────────
   if (interaction.isChatInputCommand() && interaction.commandName === 'voterestart') {
