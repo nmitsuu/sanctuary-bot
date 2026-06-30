@@ -77,7 +77,13 @@ async function isAdmin(member) {
   return member.permissions.has('Administrator');
 }
 
-async function ibLogin() {
+// Cached session cookie — avoids hammering IB with a fresh login every cycle
+let cachedCookie = null;
+let cookieFetchedAt = 0;
+const COOKIE_MAX_AGE_MS = 20 * 60 * 1000; // refresh proactively every 20 min
+
+// Performs the actual login POST
+async function ibLoginFresh() {
   const body = new URLSearchParams({ email: IB_EMAIL, password: IB_PASSWORD });
   const res = await fetch('https://dashboard.indifferentbroccoli.com/login', {
     method: 'POST',
@@ -89,6 +95,21 @@ async function ibLogin() {
   const match = setCookie.match(/indifferentSess=[^;]+/);
   if (!match) { console.error('[IB] Login failed'); return null; }
   return match[0];
+}
+
+// Returns a cached cookie, only logging in again if missing or stale.
+// Pass forceRefresh = true to discard the cache (e.g. after a failed request).
+async function ibLogin(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && cachedCookie && (now - cookieFetchedAt) < COOKIE_MAX_AGE_MS) {
+    return cachedCookie;
+  }
+  const fresh = await ibLoginFresh();
+  if (fresh) {
+    cachedCookie = fresh;
+    cookieFetchedAt = now;
+  }
+  return fresh;
 }
 
 async function ibServerMsg(cookie, text) {
@@ -162,7 +183,14 @@ async function updateStatusChannel(guild) {
     const cookie = await ibLogin();
     if (!cookie) return;
 
-    const playerData = await ibGetPlayers(cookie);
+    let playerData = await ibGetPlayers(cookie);
+
+    // If the cached cookie was stale (scrape failed), force one fresh login and retry
+    if (playerData === null) {
+      const freshCookie = await ibLogin(true);
+      if (freshCookie) playerData = await ibGetPlayers(freshCookie);
+    }
+
     const nextR  = getNextRestart();
 
     let description = '';
