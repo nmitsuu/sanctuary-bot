@@ -19,6 +19,13 @@ const VOTE_CHANNEL_ID     = process.env.VOTE_CHANNEL_ID;
 const ANNOUNCE_CHANNEL_ID = process.env.ANNOUNCE_CHANNEL_ID;
 const ANNOUNCE_ROLE_ID    = process.env.ANNOUNCE_ROLE_ID;
 const STATUS_CHANNEL_ID   = '1196857209640988803';
+
+// ── Application approval config ──────────────────────────────
+const SURVIVOR_ROLE_ID    = process.env.SURVIVOR_ROLE_ID;   // @Sanctuary Survivor role ID
+const APPS_SCRIPT_URL     = process.env.APPS_SCRIPT_URL;    // Google Apps Script web app URL
+const APPROVE_CHANNEL_ID  = process.env.APPROVE_CHANNEL_ID; // channel where /approve confirmations post (optional)
+const SERVER_IP           = process.env.SERVER_IP   || '172.240.71.145';
+const SERVER_PORT         = process.env.SERVER_PORT || '27665';
 const MIN_VOTES           = parseInt(process.env.MIN_VOTES)   || 1;
 const VOTE_MINUTES        = parseInt(process.env.VOTE_MINUTES) || 3;
 const COOLDOWN_MINUTES    = parseInt(process.env.COOLDOWN_MINUTES) || 30;
@@ -405,6 +412,14 @@ async function registerCommands() {
       .setName('nextrestart')
       .setDescription('Check when the next scheduled server restart is')
       .toJSON(),
+    new SlashCommandBuilder()
+      .setName('approve')
+      .setDescription('Approve an applicant: DMs their login, gives them the Survivor role')
+      .addUserOption(opt =>
+        opt.setName('player').setDescription('The Discord user to approve').setRequired(true))
+      .addStringOption(opt =>
+        opt.setName('ign').setDescription('Their in-game username (from the application)').setRequired(true))
+      .toJSON(),
   ];
   const rest = new REST().setToken(DISCORD_TOKEN);
   try {
@@ -416,7 +431,7 @@ async function registerCommands() {
 }
 
 // ── Discord client ────────────────────────────────────────────
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
 
 client.once('ready', async () => {
   console.log(`✅ Sanctuary Bunny online as ${client.user.tag}`);
@@ -515,6 +530,84 @@ client.on('interactionCreate', async (interaction) => {
     const r = getNextRestart();
     const timeLeft = r.diffHrs > 0 ? `${r.diffHrs}h ${r.diffMins}m` : `${r.diffMins}m`;
     await interaction.reply(`🕐 **Next Scheduled Restart:** ${r.timeStr} — ${r.fullStr} (in **${timeLeft}**)`);
+  }
+
+  // ── /approve ──────────────────────────────────────────────
+  if (interaction.isChatInputCommand() && interaction.commandName === 'approve') {
+    // Only admins can approve
+    if (!(await isAdmin(interaction.member))) {
+      return interaction.reply({ content: '❌ Only admins can approve applicants.', ephemeral: true });
+    }
+
+    const player = interaction.options.getUser('player');
+    const ign    = interaction.options.getString('ign').trim();
+    const approverName = interaction.member?.displayName || interaction.user.username;
+
+    await interaction.deferReply({ ephemeral: true });
+
+    // 1. Look up the password from the sheet by IGN
+    let username = ign, password = null, sheetRow = null;
+    try {
+      const res = await fetch(`${APPS_SCRIPT_URL}?action=lookup&ign=${encodeURIComponent(ign)}`);
+      const data = await res.json();
+      if (data.result === 'success') {
+        username = data.username;
+        password = data.password;
+        sheetRow = data.row;
+      } else {
+        return interaction.editReply(`❌ Couldn't find an application with IGN **${ign}** in the sheet. Double-check the spelling.`);
+      }
+    } catch (err) {
+      return interaction.editReply(`⚠️ Couldn't reach the application sheet. Error: ${err.message}`);
+    }
+
+    // 2. DM the player their login details
+    let dmOk = true;
+    try {
+      const dm = `🌸 Hello! Here are your login details:\n\n` +
+        `**Username:** ${username}\n` +
+        `**Password:** ${password}\n\n` +
+        `**IP:** ${SERVER_IP}\n` +
+        `**Port:** ${SERVER_PORT}\n\n` +
+        `Please let us know if you need anything! 🙇‍♀️`;
+      await player.send(dm);
+    } catch (err) {
+      dmOk = false;
+    }
+
+    // 3. Give them the Survivor role
+    let roleOk = true;
+    try {
+      const member = await interaction.guild.members.fetch(player.id);
+      await member.roles.add(SURVIVOR_ROLE_ID);
+    } catch (err) {
+      roleOk = false;
+    }
+
+    // 4. Mark the sheet with who approved them
+    if (sheetRow) {
+      try {
+        await fetch(`${APPS_SCRIPT_URL}?action=markadded&row=${sheetRow}&admin=${encodeURIComponent(approverName)}`);
+      } catch (err) { /* non-fatal */ }
+    }
+
+    // 5. Confirm — post publicly so the team sees it
+    const confirmMsg =
+      `✅ **${player} has been approved!**\n` +
+      `${dmOk ? '• DM\'d their login info' : '• ⚠️ Could NOT DM them (they may have DMs off)'}\n` +
+      `${roleOk ? '• Given the Survivor role' : '• ⚠️ Could NOT assign the role (check role ID / bot permissions)'}\n` +
+      `• Approved by **${approverName}**`;
+
+    const publicChannel = APPROVE_CHANNEL_ID
+      ? interaction.guild.channels.cache.get(APPROVE_CHANNEL_ID)
+      : interaction.channel;
+    if (publicChannel) publicChannel.send(confirmMsg).catch(() => {});
+
+    await interaction.editReply(
+      (dmOk && roleOk)
+        ? `Done! ${player.username} was DM'd and given access.`
+        : `Partially done — see the warnings in the confirmation message.`
+    );
   }
 
 });
